@@ -1,9 +1,9 @@
 # Fork patches in vendor/doubletake
 
-This repo vendors omarroth/doubletake at commit `5e2f1cb` (2026-10-29) with two small local
-patches. Both are probe hooks of the `DOUBLETAKE_*` env-var style; neither changes default
-behavior when unset. Upstreaming both (as a receiver-gated fix rather than env vars) would be
-welcome — see upstream issue #30.
+The doubletake fork in `vendor/doubletake` is based on omarroth/doubletake at commit `5e2f1cb`
+(2026-10-29) and carries three local patches. All are probe hooks of the `DOUBLETAKE_*`
+env-var style; none changes default behavior when unset. Upstreaming them (as a receiver-gated
+fix rather than env vars) would be welcome — see upstream issue #30.
 
 ## 1. `DOUBLETAKE_TIMING=NTP|PTP` — internal/airplay/mirror.go
 
@@ -40,6 +40,20 @@ for this TV and kept for future receivers.
 - `completeSRPExchange`: under `-debug`, logs salt/pubkey lengths, PIN length, effective pair
   type. Used to pin down the PIN-expiry failure mode: PIN entered ~45 s after `pair-pin-start`
   → M4 error 2 (authentication); ~17 s → success. Samsung codes are short-lived; enter fast.
+
+## 4. `DOUBLETAKE_RESTORE_SCOPE=<name>` — internal/airplay/credentials.go (+ daemon/cmd read sites)
+
+`SavedCredentials` stored exactly one Wayland screencast restore token per device
+(`restore_token`). samsung-cast's extend mode streams a virtual Hyprland headless output
+instead of the laptop panel, so a single token makes each mode silently restore the other
+mode's monitor — extend would clone the laptop screen instead of extending. With the env var
+set, `CredentialStore.SaveRestoreToken` writes into a new per-device `restore_tokens` map
+keyed by scope, and the three read sites (daemon connect, daemon HEVC fallback, standalone
+`prepareCapture`) read via `SavedCredentials.RestoreTokenForScope(RestoreScope())`. Unset
+(empty scope) keeps the legacy field and the previous behavior byte-for-byte. samsung-cast
+starts the daemon with `DOUBLETAKE_RESTORE_SCOPE=extend` in extend mode and without it for
+mirroring, so both capture targets restore silently and independently (one picker each, once
+ever). Covered by `credentials_scope_test.go`.
 
 ## Not patched (observed, non-fatal)
 

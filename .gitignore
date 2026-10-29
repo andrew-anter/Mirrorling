@@ -1,3 +1,4 @@
 bin/
-vendor/
+vendor/doubletake/bin/
+vendor/doubletake/artifacts/
 *.log

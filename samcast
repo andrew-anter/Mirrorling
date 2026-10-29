@@ -13,6 +13,7 @@ CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/samsung-cast"
 CONF="$CONF_DIR/config"
 RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 SOCK="$RUNTIME_DIR/doubletake.sock"
+MODE_FILE="$RUNTIME_DIR/samsung-cast.mode"
 UNIT="samsung-cast"
 
 # First run: write a config with working defaults for this TV.
@@ -26,6 +27,7 @@ SAMCAST_HWACCEL=auto            # auto | vaapi | nvenc | openh264 | none
 SAMCAST_PORT_RANGE="60000-60010"
 SAMCAST_TIMING="NTP"            # NTP | PTP — CU7000 advertises PTP but SETUP omits ClockID (upstream #30)
 SAMCAST_EXTRA_FLAGS=""          # extra doubletake flags, e.g. "-bitrate 4500 -no-audio"
+SAMCAST_EXTEND_OUTPUT="SAMCAST" # virtual Hyprland output streamed in extend mode
 EOF
     echo "samsung-cast: wrote default config to $CONF"
 fi
@@ -36,24 +38,30 @@ source "$CONF"
 # force NTP unless overridden (upstream doubletake issue #30, Finding 3).
 export DOUBLETAKE_TIMING="${SAMCAST_TIMING:-NTP}"
 
+# Extend-mode knob added after this config was first written.
+SAMCAST_EXTEND_OUTPUT="${SAMCAST_EXTEND_OUTPUT:-SAMCAST}"
+
 usage() {
     cat <<EOF
-samsung-cast — mirror this desktop to "$SAMCAST_NAME" (Samsung AirPlay 2)
+samsung-cast — mirror or extend this desktop to "$SAMCAST_NAME" (Samsung AirPlay 2)
 
   samcast discover        list Samsung AirPlay receivers on the LAN
   samcast target          print resolved TV IP
   samcast pair            first-time pairing (PIN appears on the TV)
   samcast start           start the background daemon (systemd-run --user)
   samcast stop            stop the daemon
-  samcast status          daemon + stream status
-  samcast on [PIN]        start mirroring to the TV
-  samcast off             stop mirroring
-  samcast toggle          on <-> off (bind this to a Hyprland key)
+  samcast status          daemon + stream status (+ active mode)
+  samcast on [PIN]        start mirroring (same as: samcast mirror)
+  samcast mirror [PIN]    mirror the current screen (clone) to the TV
+  samcast extend [PIN]    extend: stream a virtual Hyprland output instead —
+                          the TV becomes a second monitor; drag windows onto it
+  samcast off             stop mirroring/extending (removes the virtual output)
+  samcast toggle          mirror on <-> off (bind this to a Hyprland key)
   samcast devices         devices the daemon can see
   samcast log [-f]        daemon logs (journalctl)
 
 Env overrides after config: SAMCAST_NAME, SAMCAST_FPS, SAMCAST_HWACCEL,
-SAMCAST_PORT_RANGE, SAMCAST_EXTRA_FLAGS.
+SAMCAST_PORT_RANGE, SAMCAST_EXTRA_FLAGS, SAMCAST_EXTEND_OUTPUT.
 EOF
 }
 
@@ -101,40 +109,114 @@ cmd_pair() {
     exec "$DOUBLETAKE" -target "$TARGET_IP" -port "$TARGET_PORT" -pair $(stream_flags)
 }
 
+# Start the daemon with the given restore-token scope ("" = mirror).
+# DOUBLETAKE_RESTORE_SCOPE selects which saved xdg-desktop-portal restore
+# token the daemon uses (vendor patch #4), so mirror and extend remember
+# different capture monitors.
 cmd_start() {
+    local scope="${1:-}" desc="mirroring"
+    [ -n "$scope" ] && desc="extending"
     if systemctl --user is-active --quiet "$UNIT"; then
         echo "daemon already running"
     else
+        local envargs=(--setenv="DOUBLETAKE_TIMING=$DOUBLETAKE_TIMING")
+        [ -n "$scope" ] && envargs+=(--setenv="DOUBLETAKE_RESTORE_SCOPE=$scope")
         # shellcheck disable=SC2086
-        systemd-run --user --unit="$UNIT" --setenv=DOUBLETAKE_TIMING="$DOUBLETAKE_TIMING" \
-            --description="samsung-cast AirPlay mirroring daemon" \
+        systemd-run --user --unit="$UNIT" "${envargs[@]}" \
+            --description="samsung-cast AirPlay $desc daemon" \
             "$DOUBLETAKE" -daemonize -port-range "$SAMCAST_PORT_RANGE" \
             -fps "$SAMCAST_FPS" -hwaccel "$SAMCAST_HWACCEL" $SAMCAST_EXTRA_FLAGS
     fi
+    printf '%s\n' "${scope:-mirror}" > "$MODE_FILE" 2>/dev/null || true
     for _ in $(seq 1 40); do [ -S "$SOCK" ] && break; sleep 0.25; done
     [ -S "$SOCK" ] || die "daemon socket $SOCK never appeared (journalctl --user -u $UNIT)"
     "$CTL" status
 }
 
-cmd_stop()   { "$CTL" disconnect 2>/dev/null || true; systemctl --user stop "$UNIT" 2>/dev/null || true; echo "stopped"; }
-cmd_status() { "$CTL" status 2>/dev/null || die "daemon not running (samcast start)"; }
+# Restart the daemon when the requested scope differs from the running one.
+ensure_mode() {
+    local scope="$1" want="${scope:-mirror}" current=""
+    [ -f "$MODE_FILE" ] && current="$(cat "$MODE_FILE" 2>/dev/null)"
+    if [ "$current" = "$want" ] && systemctl --user is-active --quiet "$UNIT"; then
+        return 0
+    fi
+    systemctl --user stop "$UNIT" 2>/dev/null || true
+    for _ in $(seq 1 20); do
+        [ "$(systemctl --user is-active "$UNIT" 2>/dev/null)" != "active" ] && break
+        sleep 0.25
+    done
+    rm -f "$SOCK"
+    cmd_start "$scope" >/dev/null
+}
+
+cmd_stop()   {
+    "$CTL" disconnect 2>/dev/null || true
+    systemctl --user stop "$UNIT" 2>/dev/null || true
+    rm -f "$MODE_FILE"
+    remove_extend_output
+    echo "stopped"
+}
+cmd_status() {
+    "$CTL" status 2>/dev/null || die "daemon not running (samcast start)"
+    if [ -f "$MODE_FILE" ]; then echo "mode: $(cat "$MODE_FILE" 2>/dev/null || echo mirror)"; fi
+}
 cmd_devices(){ "$CTL" devices 2>/dev/null || die "daemon not running (samcast start)"; }
 
-cmd_on() {
+require_hyprland() {
+    command -v hyprctl >/dev/null 2>&1 || die "extend mode needs Hyprland (hyprctl not found)"
+    [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ] || die "extend mode needs a running Hyprland session"
+}
+
+# Create the virtual (headless) Hyprland output streamed in extend mode.
+# It comes up 1920x1080@60 right of the last real monitor — the TV's AirPlay
+# canvas — and keeps a fixed name so the portal restore token stays valid.
+ensure_extend_output() {
+    hyprctl monitors 2>/dev/null | grep -Fq "$SAMCAST_EXTEND_OUTPUT (" && return 0
+    hyprctl output create headless "$SAMCAST_EXTEND_OUTPUT" >/dev/null \
+        || die "cannot create headless output '$SAMCAST_EXTEND_OUTPUT'"
+    local _
+    for _ in $(seq 1 20); do
+        hyprctl monitors 2>/dev/null | grep -Fq "$SAMCAST_EXTEND_OUTPUT (" && return 0
+        sleep 0.25
+    done
+    die "headless output '$SAMCAST_EXTEND_OUTPUT' did not appear (hyprctl monitors)"
+}
+
+remove_extend_output() {
+    hyprctl output remove "$SAMCAST_EXTEND_OUTPUT" >/dev/null 2>&1 || true
+}
+
+# Shared stream start: cmd_stream <mirror|extend> [PIN]
+cmd_stream() {
+    local mode="$1" pin="${2:-}" scope="" label="Mirroring"
+    if [ "$mode" = "extend" ]; then
+        require_hyprland
+        ensure_extend_output
+        scope="extend"; label="Extending"
+    fi
     resolve_target
-    [ "$(systemctl --user is-active "$UNIT" 2>/dev/null || true)" = "active" ] || cmd_start
+    ensure_mode "$scope"
     # The daemon resolves the AirPlay port from its own mDNS cache; wait until
     # the TV shows up there (a freshly started daemon needs a few seconds).
+    local _
     for _ in $(seq 1 40); do
         "$CTL" devices 2>/dev/null | grep -Fq "$TARGET_IP" && break
         sleep 0.5
     done
-    echo "Mirroring to $SAMCAST_NAME ($TARGET_IP:$TARGET_PORT)..."
-    # shellcheck disable=SC2086
-    if [ $# -gt 0 ]; then "$CTL" connect "$TARGET_IP" "$1"; else "$CTL" connect "$TARGET_IP"; fi
+    echo "$label to $SAMCAST_NAME ($TARGET_IP:$TARGET_PORT)..."
+    if [ -n "$pin" ]; then "$CTL" connect "$TARGET_IP" "$pin"; else "$CTL" connect "$TARGET_IP"; fi
 }
 
-cmd_off()     { "$CTL" disconnect 2>/dev/null || true; echo "mirroring stopped"; }
+cmd_on()     { cmd_stream mirror "${1:-}"; }
+cmd_extend() { cmd_stream extend "${1:-}"; }
+
+cmd_off()     {
+    "$CTL" disconnect 2>/dev/null || true
+    if [ -f "$MODE_FILE" ] && [ "$(cat "$MODE_FILE" 2>/dev/null)" = "extend" ]; then
+        remove_extend_output
+    fi
+    echo "mirroring stopped"
+}
 
 cmd_toggle() {
     resolve_target
@@ -153,6 +235,8 @@ case "$cmd" in
     status)   cmd_status ;;
     devices)  cmd_devices ;;
     on)       cmd_on "$@" ;;
+    mirror)   cmd_on "$@" ;;
+    extend)   cmd_extend "$@" ;;
     off)      cmd_off ;;
     toggle)   cmd_toggle ;;
     log)      cmd_log "$@" ;;
