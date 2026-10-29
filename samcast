@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # samsung-cast: wireless desktop mirroring from this laptop to the Samsung
-# 58CU7000 (Tizen AirPlay 2) via omarroth/doubletake.
+# 58CU7000 (Tizen AirPlay 2) via the doubletake-samsung fork.
 #
 # Config: ~/.config/samsung-cast/config (sourced shell, written on first run)
 # Logs:   journalctl --user -u samsung-cast
@@ -17,7 +17,6 @@ CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/samsung-cast"
 CONF="$CONF_DIR/config"
 RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 SOCK="$RUNTIME_DIR/doubletake.sock"
-MODE_FILE="$RUNTIME_DIR/samsung-cast.mode"
 UNIT="samsung-cast"
 
 # First run: write a config with working defaults for this TV.
@@ -31,10 +30,6 @@ SAMCAST_HWACCEL=auto            # auto | vaapi | nvenc | openh264 | none
 SAMCAST_PORT_RANGE="60000-60010"
 SAMCAST_TIMING="NTP"            # NTP | PTP — CU7000 advertises PTP but SETUP omits ClockID (upstream #30)
 SAMCAST_EXTRA_FLAGS=""          # extra doubletake flags, e.g. "-bitrate 4500 -no-audio"
-SAMCAST_EXTEND_OUTPUT="SAMCAST" # virtual Hyprland output streamed in extend mode
-SAMCAST_EXTEND_MODE="3840x2160@60" # virtual output resolution (TV is 4K; use 1920x1080@60 on weak Wi-Fi)
-SAMCAST_EXTEND_FPS="30"        # extend stream fps — 4K60 can stall the TV's Wi-Fi; raise to 60 on solid 5 GHz
-SAMCAST_EXTEND_CODEC="hevc"    # extend stream codec: hevc unlocks the TV's 4K canvas; h264 = 1080p
 EOF
     echo "samsung-cast: wrote default config to $CONF"
 fi
@@ -45,35 +40,25 @@ source "$CONF"
 # force NTP unless overridden (upstream doubletake issue #30, Finding 3).
 export DOUBLETAKE_TIMING="${SAMCAST_TIMING:-NTP}"
 
-# Extend-mode knobs added after this config was first written.
-SAMCAST_EXTEND_OUTPUT="${SAMCAST_EXTEND_OUTPUT:-SAMCAST}"
-SAMCAST_EXTEND_MODE="${SAMCAST_EXTEND_MODE:-3840x2160@60}"
-SAMCAST_EXTEND_FPS="${SAMCAST_EXTEND_FPS:-30}"
-SAMCAST_EXTEND_CODEC="${SAMCAST_EXTEND_CODEC:-hevc}"
-
 usage() {
     cat <<EOF
-samsung-cast — mirror or extend this desktop to "$SAMCAST_NAME" (Samsung AirPlay 2)
+samsung-cast — mirror this desktop to "$SAMCAST_NAME" (Samsung AirPlay 2)
 
   samcast discover        list Samsung AirPlay receivers on the LAN
   samcast target          print resolved TV IP
   samcast pair            first-time pairing (PIN appears on the TV)
   samcast start           start the background daemon (systemd-run --user)
   samcast stop            stop the daemon
-  samcast status          daemon + stream status (+ active mode)
+  samcast status          daemon + stream status
   samcast on [PIN]        start mirroring (same as: samcast mirror)
-  samcast mirror [PIN]    mirror the current screen (clone) to the TV
-  samcast extend [PIN]    extend: stream a virtual Hyprland output instead —
-                          the TV (4K panel) becomes a second monitor at its
-                          native 3840x2160 via HEVC; drag windows onto it
-  samcast off             stop mirroring/extending (removes the virtual output)
-  samcast toggle          mirror on <-> off (bind this to a Hyprland key)
+  samcast mirror [PIN]    mirror the current screen to the TV
+  samcast off             stop mirroring
+  samcast toggle          mirror on <-> off (bind this to a key)
   samcast devices         devices the daemon can see
   samcast log [-f]        daemon logs (journalctl)
 
 Env overrides after config: SAMCAST_NAME, SAMCAST_FPS, SAMCAST_HWACCEL,
-SAMCAST_PORT_RANGE, SAMCAST_EXTRA_FLAGS, SAMCAST_EXTEND_OUTPUT,
-SAMCAST_EXTEND_MODE, SAMCAST_EXTEND_FPS, SAMCAST_EXTEND_CODEC.
+SAMCAST_PORT_RANGE, SAMCAST_EXTRA_FLAGS.
 EOF
 }
 
@@ -121,124 +106,33 @@ cmd_pair() {
     exec "$DOUBLETAKE" -target "$TARGET_IP" -port "$TARGET_PORT" -pair $(stream_flags)
 }
 
-# Start the daemon with the given restore-token scope ("" = mirror).
-# DOUBLETAKE_RESTORE_SCOPE selects which saved xdg-desktop-portal restore
-# token the daemon uses (vendor patch #4), so mirror and extend remember
-# different capture monitors.
 cmd_start() {
-    local scope="${1:-}" desc="mirroring"
-    [ -n "$scope" ] && desc="extending"
     if systemctl --user is-active --quiet "$UNIT"; then
         echo "daemon already running"
     else
-        local envargs=(--setenv="DOUBLETAKE_TIMING=$DOUBLETAKE_TIMING")
-        [ -n "$scope" ] && envargs+=(--setenv="DOUBLETAKE_RESTORE_SCOPE=$scope")
-        # HEVC unlocks this TV's 4K canvas; H.264 caps it at 1080p. Extend
-        # defaults to 30 fps: 4K60 HEVC bursts stall this TV's Wi-Fi link.
-        local codecflags="" fps="$SAMCAST_FPS"
-        if [ "$scope" = "extend" ]; then
-            [ -n "$SAMCAST_EXTEND_FPS" ] && fps="$SAMCAST_EXTEND_FPS"
-            if [ -n "$SAMCAST_EXTEND_CODEC" ] && [ "$SAMCAST_EXTEND_CODEC" != "auto" ]; then
-                codecflags="-video-codec $SAMCAST_EXTEND_CODEC"
-            fi
-        fi
-        # shellcheck disable=SC2086
-        systemd-run --user --unit="$UNIT" "${envargs[@]}" \
-            --description="samsung-cast AirPlay $desc daemon" \
+        systemd-run --user --unit="$UNIT" \
+            --setenv="DOUBLETAKE_TIMING=$DOUBLETAKE_TIMING" \
+            --description="samsung-cast AirPlay mirroring daemon" \
             "$DOUBLETAKE" -daemonize -port-range "$SAMCAST_PORT_RANGE" \
-            -fps "$fps" -hwaccel "$SAMCAST_HWACCEL" $codecflags $SAMCAST_EXTRA_FLAGS
+            -fps "$SAMCAST_FPS" -hwaccel "$SAMCAST_HWACCEL" $SAMCAST_EXTRA_FLAGS
     fi
-    printf '%s\n' "${scope:-mirror}" > "$MODE_FILE" 2>/dev/null || true
     for _ in $(seq 1 40); do [ -S "$SOCK" ] && break; sleep 0.25; done
     [ -S "$SOCK" ] || die "daemon socket $SOCK never appeared (journalctl --user -u $UNIT)"
     "$CTL" status
 }
 
-# Restart the daemon when the requested scope differs from the running one.
-ensure_mode() {
-    local scope="$1" want="${scope:-mirror}" current=""
-    [ -f "$MODE_FILE" ] && current="$(cat "$MODE_FILE" 2>/dev/null)"
-    if [ "$current" = "$want" ] && systemctl --user is-active --quiet "$UNIT"; then
-        return 0
-    fi
-    systemctl --user stop "$UNIT" 2>/dev/null || true
-    for _ in $(seq 1 20); do
-        [ "$(systemctl --user is-active "$UNIT" 2>/dev/null)" != "active" ] && break
-        sleep 0.25
-    done
-    rm -f "$SOCK"
-    cmd_start "$scope" >/dev/null
-}
-
 cmd_stop()   {
     "$CTL" disconnect 2>/dev/null || true
     systemctl --user stop "$UNIT" 2>/dev/null || true
-    rm -f "$MODE_FILE"
-    remove_extend_output
     echo "stopped"
 }
-cmd_status() {
-    "$CTL" status 2>/dev/null || die "daemon not running (samcast start)"
-    if [ -f "$MODE_FILE" ]; then echo "mode: $(cat "$MODE_FILE" 2>/dev/null || echo mirror)"; fi
-}
+cmd_status() { "$CTL" status 2>/dev/null || die "daemon not running (samcast start)"; }
 cmd_devices(){ "$CTL" devices 2>/dev/null || die "daemon not running (samcast start)"; }
 
-require_hyprland() {
-    command -v hyprctl >/dev/null 2>&1 || die "extend mode needs Hyprland (hyprctl not found)"
-    [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ] || die "extend mode needs a running Hyprland session"
-}
-
-# Current resolution ("WxH") of a monitor, empty if absent.
-output_width_height() {
-    hyprctl monitors 2>/dev/null | awk -v o="$1" '
-        $1 == "Monitor" && $2 == o { grab = 1; next }
-        grab && /@/ { split($1, m, "@"); print m[1]; exit }'
-}
-
-# Create the virtual (headless) Hyprland output streamed in extend mode and
-# force its mode to $SAMCAST_EXTEND_MODE (4K for this TV). Hyprland 0.56
-# cannot set headless modes at runtime via hyprctl (keyword monitor is
-# rejected and config lines do not apply to created headless outputs), so a
-# non-default mode needs wlr-randr (wlr-output-management).
-ensure_extend_output() {
-    if ! hyprctl monitors 2>/dev/null | grep -Fq "$SAMCAST_EXTEND_OUTPUT ("; then
-        hyprctl output create headless "$SAMCAST_EXTEND_OUTPUT" >/dev/null \
-            || die "cannot create headless output '$SAMCAST_EXTEND_OUTPUT'"
-        local _
-        for _ in $(seq 1 20); do
-            hyprctl monitors 2>/dev/null | grep -Fq "$SAMCAST_EXTEND_OUTPUT (" && break
-            sleep 0.25
-        done
-        hyprctl monitors 2>/dev/null | grep -Fq "$SAMCAST_EXTEND_OUTPUT (" \
-            || die "headless output '$SAMCAST_EXTEND_OUTPUT' did not appear (hyprctl monitors)"
-    fi
-    local cur want="${SAMCAST_EXTEND_MODE%%@*}"
-    cur="$(output_width_height "$SAMCAST_EXTEND_OUTPUT")"
-    [ "$cur" = "$want" ] && return 0
-    if command -v wlr-randr >/dev/null 2>&1; then
-        wlr-randr --output "$SAMCAST_EXTEND_OUTPUT" --custom-mode "$SAMCAST_EXTEND_MODE" >/dev/null 2>&1 \
-            || wlr-randr --output "$SAMCAST_EXTEND_OUTPUT" --mode "$SAMCAST_EXTEND_MODE" >/dev/null 2>&1 || true
-        sleep 0.5
-        cur="$(output_width_height "$SAMCAST_EXTEND_OUTPUT")"
-    fi
-    [ "$cur" = "$want" ] || die "output '$SAMCAST_EXTEND_OUTPUT' is ${cur:-unknown}, want $want.
-Install wlr-randr (sudo pacman -S wlr-randr) or set SAMCAST_EXTEND_MODE=1920x1080@60 in $CONF"
-}
-
-remove_extend_output() {
-    hyprctl output remove "$SAMCAST_EXTEND_OUTPUT" >/dev/null 2>&1 || true
-}
-
-# Shared stream start: cmd_stream <mirror|extend> [PIN]
-cmd_stream() {
-    local mode="$1" pin="${2:-}" scope="" label="Mirroring"
-    if [ "$mode" = "extend" ]; then
-        require_hyprland
-        ensure_extend_output
-        scope="extend"; label="Extending"
-    fi
+cmd_on() {
+    local pin="${1:-}"
     resolve_target
-    ensure_mode "$scope"
+    systemctl --user is-active --quiet "$UNIT" || cmd_start >/dev/null
     # The daemon resolves the AirPlay port from its own mDNS cache; wait until
     # the TV shows up there (a freshly started daemon needs a few seconds).
     local _
@@ -246,18 +140,12 @@ cmd_stream() {
         "$CTL" devices 2>/dev/null | grep -Fq "$TARGET_IP" && break
         sleep 0.5
     done
-    echo "$label to $SAMCAST_NAME ($TARGET_IP:$TARGET_PORT)..."
+    echo "Mirroring to $SAMCAST_NAME ($TARGET_IP:$TARGET_PORT)..."
     if [ -n "$pin" ]; then "$CTL" connect "$TARGET_IP" "$pin"; else "$CTL" connect "$TARGET_IP"; fi
 }
 
-cmd_on()     { cmd_stream mirror "${1:-}"; }
-cmd_extend() { cmd_stream extend "${1:-}"; }
-
-cmd_off()     {
+cmd_off()   {
     "$CTL" disconnect 2>/dev/null || true
-    if [ -f "$MODE_FILE" ] && [ "$(cat "$MODE_FILE" 2>/dev/null)" = "extend" ]; then
-        remove_extend_output
-    fi
     echo "mirroring stopped"
 }
 
@@ -279,7 +167,6 @@ case "$cmd" in
     devices)  cmd_devices ;;
     on)       cmd_on "$@" ;;
     mirror)   cmd_on "$@" ;;
-    extend)   cmd_extend "$@" ;;
     off)      cmd_off ;;
     toggle)   cmd_toggle ;;
     log)      cmd_log "$@" ;;
