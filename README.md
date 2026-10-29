@@ -145,7 +145,8 @@ monitors.
 samsung-cast is closed source: the `samcast` CLI, docs, and all other contents of this repo are
 Copyright (C) 2026 samsung-cast contributors. All rights reserved.
 
-The build depends on `../doubletake-samsung` (push to GitHub as its own public repo), a modified
+The build depends on [doubletake-samsung](https://github.com/andrew-anter/doubletake-samsung)
+(sibling clone, `../doubletake-samsung`), a modified
 fork of [omarroth/doubletake](https://github.com/omarroth/doubletake) released under the LGPL-3.0
 — see that repo's `LICENSE` and `PATCHES.md`. samcast executes its binaries as a separate process
 and contains none of its code.
