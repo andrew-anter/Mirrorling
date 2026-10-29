@@ -1,9 +1,9 @@
 # Fork patches in vendor/doubletake
 
 The doubletake fork in `vendor/doubletake` is based on omarroth/doubletake at commit `5e2f1cb`
-(2026-10-29) and carries three local patches. All are probe hooks of the `DOUBLETAKE_*`
-env-var style; none changes default behavior when unset. Upstreaming them (as a receiver-gated
-fix rather than env vars) would be welcome — see upstream issue #30.
+(2026-10-29) and carries five local patches. Patches 1–4 are probe hooks of the `DOUBLETAKE_*`
+env-var style; none changes default behavior when unset. Patch 5 changes the default audio
+capture source. Upstreaming them would be welcome — see upstream issue #30.
 
 ## 1. `DOUBLETAKE_TIMING=NTP|PTP` — internal/airplay/mirror.go
 
@@ -54,6 +54,24 @@ keyed by scope, and the three read sites (daemon connect, daemon HEVC fallback, 
 starts the daemon with `DOUBLETAKE_RESTORE_SCOPE=extend` in extend mode and without it for
 mirroring, so both capture targets restore silently and independently (one picker each, once
 ever). Covered by `credentials_scope_test.go`.
+
+## 5. Default-output audio via `@DEFAULT_MONITOR@` — internal/airplay/audio.go
+
+Upstream resolved `pactl get-default-sink` at capture start and pinned
+`pulsesrc device=<sink>.monitor`. When the session's default sink is a handler's
+virtual device (here the PipeWire echo-cancel sink), mirrored audio stayed bound
+to that handler's monitor even after the user re-routed default output — and a
+failed `pactl` lookup silently fell back to a bare `pipewiresrc`, which attaches
+to the default *source* (the microphone). The fork instead passes the
+sound-server alias `device=@DEFAULT_MONITOR@`: the server itself resolves it at
+every stream start, so audio always follows the current default output device,
+whichever handler provides it.
+
+This is the one fork patch that changes default behavior. It also drops the
+`pulseaudio-utils` (`pactl`) runtime dependency on the audio path. Verified on
+this machine: `pulsesrc device=@DEFAULT_MONITOR@` negotiates 44.1 kHz stereo,
+and `StartAudioCapture` produces compressed ALAC frames through the full
+timestamped pipeline.
 
 ## Not patched (observed, non-fatal)
 

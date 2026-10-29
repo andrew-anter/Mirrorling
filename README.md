@@ -97,7 +97,7 @@ start silently.
 | Pairing (PIN on TV, SRP over HAP type 3) | ✅ credentials saved at `~/.config/doubletake/credentials.json` |
 | Mirroring (portal capture → NVENC → encrypted H.264, NTP timing) | ✅ `state: streaming` |
 | Extend mode (virtual headless output → scoped portal capture) | ✅ 4K30 HEVC `state: streaming` (4K60 stalls the TV's Wi-Fi) |
-| Audio (ALAC over ChaCha20, from `echo_cancel_sink.monitor`) | ✅ |
+| Audio (ALAC over ChaCha20, follows the system default output) | ✅ |
 
 Patches applied to the fork (`vendor/doubletake`, documented in `docs/patches.md`):
 `DOUBLETAKE_TIMING=NTP` override — the CU7000 advertises PTP (feature 41) but its SETUP
@@ -131,8 +131,12 @@ monitors.
   volume at all (verified live mid-session). When an AirPlay session closes, Tizen resets its
   speaker volume to 100%; that is firmware behavior with no sender-side fix. Lower the volume
   with the TV remote after casting, or try the TV's Sound → Auto Volume setting.
-- Mirrored audio comes from `echo_cancel_sink.monitor` (doubletake picks the monitor of the
-  default sink — here the PipeWire echo-cancel sink). If TV audio is silent, check your default
-  output routing in pavucontrol.
+- Mirrored audio captures the monitor of whatever the sound server's current
+  default output is (`pulsesrc device=@DEFAULT_MONITOR@`, patch #5 in
+  `docs/patches.md`), resolved at each stream start — no longer pinned to the
+  sink that was default when the daemon started (previously
+  `echo_cancel_sink.monitor` here). If TV audio is silent, check your default
+  output routing in pavucontrol; a routing change applies from the next stream
+  start.
 - doubletake upstream disclaimer applies: much of its code was LLM-written, reviewed but not
   security-audited. LAN-only traffic, no inbound TCP, no port forwarding.

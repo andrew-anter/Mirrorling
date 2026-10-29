@@ -161,11 +161,16 @@ func audioCaptureFragmentTime(codec AudioCodec) time.Duration {
 	return time.Duration(microseconds) * time.Microsecond
 }
 
-func pulseMonitorSourceArgs(monitor string, codec AudioCodec) []string {
+// pulseMonitorSourceArgs captures the monitor of the sound server's current
+// default sink via the PulseAudio @DEFAULT_MONITOR@ alias. The server resolves
+// the alias on every connection, so mirrored audio follows the session's
+// default output device — whichever handler currently provides it — instead of
+// a monitor name pinned to one sink at detection time.
+func pulseMonitorSourceArgs(codec AudioCodec) []string {
 	fragmentTime := audioCaptureFragmentTime(codec)
 	return []string{
 		"pulsesrc",
-		fmt.Sprintf("device=%s", monitor),
+		"device=@DEFAULT_MONITOR@",
 		// Keep the source read granularity at one codec frame, but give the
 		// device-side ring enough capacity to survive a scheduler stall. The
 		// downstream queue cannot preserve samples that pulsesrc has not read.
@@ -174,13 +179,15 @@ func pulseMonitorSourceArgs(monitor string, codec AudioCodec) []string {
 	}
 }
 
-func selectAudioMonitorSource(hasPulse bool, monitor string, hasPipeWire bool, codec AudioCodec) ([]string, string) {
-	// Pulse-on-PipeWire keeps a hardware monitor active while its sink is
-	// suspended. That gives the sender silent frames immediately and lets later
-	// playback enter the same stream. A pipewiresrc attached directly to the
-	// suspended sink can remain idle permanently.
-	if hasPulse && monitor != "" {
-		return pulseMonitorSourceArgs(monitor, codec), "pulse"
+func selectAudioMonitorSource(hasPulse bool, hasPipeWire bool, codec AudioCodec) ([]string, string) {
+	// The pulse plugin with the @DEFAULT_MONITOR@ alias is preferred over a
+	// bare pipewiresrc. Pulse-on-PipeWire keeps a hardware monitor active
+	// while its sink is suspended: that gives the sender silent frames
+	// immediately and lets later playback enter the same stream. A
+	// pipewiresrc attached directly to the suspended sink can remain idle
+	// permanently.
+	if hasPulse {
+		return pulseMonitorSourceArgs(codec), "pulse"
 	}
 	if hasPipeWire {
 		return []string{"pipewiresrc", "client-name=doubletake"}, "pipewire"
@@ -260,17 +267,13 @@ func StartAudioCapture(ctx context.Context, testTone bool, codec AudioCodec) (*A
 	} else {
 		hasPipeWireSource := exec.Command("gst-inspect-1.0", "pipewiresrc").Run() == nil
 		hasPulseSource := exec.Command("gst-inspect-1.0", "pulsesrc").Run() == nil
-		monitor := ""
-		if hasPulseSource {
-			monitor = detectPulseMonitor()
-		}
 		var source string
-		srcArgs, source = selectAudioMonitorSource(hasPulseSource, monitor, hasPipeWireSource, codec)
+		srcArgs, source = selectAudioMonitorSource(hasPulseSource, hasPipeWireSource, codec)
 		switch source {
 		case "pulse":
 			fragmentTime := audioCaptureFragmentTime(codec)
-			dbg("[AUDIO] using pulsesrc device=%s (buffer=%s fragment=%s)",
-				monitor, audioCaptureStallBuffer, fragmentTime)
+			dbg("[AUDIO] using pulsesrc device=@DEFAULT_MONITOR@ (buffer=%s fragment=%s)",
+				audioCaptureStallBuffer, fragmentTime)
 		case "pipewire":
 			dbg("[AUDIO] using default pipewiresrc")
 		default:
@@ -642,20 +645,6 @@ func (w *bitWriter) flush() int {
 		w.pos++
 	}
 	return w.pos
-}
-
-// detectPulseMonitor finds the default PulseAudio sink's monitor source name.
-func detectPulseMonitor() string {
-	out, err := exec.Command("pactl", "get-default-sink").Output()
-	if err != nil {
-		dbg("[AUDIO] pactl get-default-sink failed: %v", err)
-		return ""
-	}
-	sinkName := strings.TrimSpace(string(out))
-	if sinkName == "" {
-		return ""
-	}
-	return sinkName + ".monitor"
 }
 
 type audioPacketHistoryEntry struct {

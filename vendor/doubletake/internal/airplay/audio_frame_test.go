@@ -44,10 +44,10 @@ func TestAudioCapturePipelineUsesTimestampedFramingWhenAvailable(t *testing.T) {
 }
 
 func TestPulseMonitorSourceSeparatesStallBufferFromFragment(t *testing.T) {
-	args := strings.Join(pulseMonitorSourceArgs("test.monitor", AudioCodecALAC), " ")
+	args := strings.Join(pulseMonitorSourceArgs(AudioCodecALAC), " ")
 	for _, want := range []string{
 		"pulsesrc",
-		"device=test.monitor",
+		"device=@DEFAULT_MONITOR@",
 		"buffer-time=250000",
 		"latency-time=7982",
 	} {
@@ -64,34 +64,27 @@ func TestAudioMonitorSourceSelection(t *testing.T) {
 	for _, test := range []struct {
 		name        string
 		hasPulse    bool
-		monitor     string
 		hasPipeWire bool
 		wantSource  string
 		wantArgs    []string
 	}{
 		{
 			name: "Pulse monitor preferred when both plugins exist", hasPulse: true,
-			monitor: "test.monitor", hasPipeWire: true, wantSource: "pulse",
-			wantArgs: []string{"pulsesrc", "device=test.monitor", "buffer-time=250000", "latency-time=7982"},
+			hasPipeWire: true, wantSource: "pulse",
+			wantArgs: []string{"pulsesrc", "device=@DEFAULT_MONITOR@", "buffer-time=250000", "latency-time=7982"},
 		},
 		{
-			name: "native Pulse monitor", hasPulse: true,
-			monitor: "test.monitor", wantSource: "pulse",
-			wantArgs: []string{"pulsesrc", "device=test.monitor", "buffer-time=250000", "latency-time=7982"},
+			name: "native Pulse monitor", hasPulse: true, wantSource: "pulse",
+			wantArgs: []string{"pulsesrc", "device=@DEFAULT_MONITOR@", "buffer-time=250000", "latency-time=7982"},
 		},
 		{
 			name: "PipeWire fallback without Pulse plugin", hasPipeWire: true, wantSource: "pipewire",
 			wantArgs: []string{"pipewiresrc", "client-name=doubletake"},
 		},
-		{
-			name: "PipeWire fallback without detected monitor", hasPulse: true,
-			hasPipeWire: true, wantSource: "pipewire",
-			wantArgs: []string{"pipewiresrc", "client-name=doubletake"},
-		},
 		{name: "no source plugin", wantSource: ""},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			args, source := selectAudioMonitorSource(test.hasPulse, test.monitor, test.hasPipeWire, AudioCodecALAC)
+			args, source := selectAudioMonitorSource(test.hasPulse, test.hasPipeWire, AudioCodecALAC)
 			if source != test.wantSource {
 				t.Fatalf("source = %q, want %q", source, test.wantSource)
 			}
