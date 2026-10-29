@@ -4,6 +4,10 @@
 #
 # Config: ~/.config/samsung-cast/config (sourced shell, written on first run)
 # Logs:   journalctl --user -u samsung-cast
+#
+# Copyright (C) 2026 samsung-cast contributors. All rights reserved.
+# Closed source — see README. Builds against the LGPL-3.0 doubletake-samsung
+# fork (separate repo, ../doubletake-samsung), invoked as a separate process.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

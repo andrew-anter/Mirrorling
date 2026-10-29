@@ -1,10 +1,10 @@
 # samsung-cast
 
 AirPlay 2 screen sender for Linux: **mirror** your desktop to a Samsung Tizen TV, or use the TV
-as a **second monitor** (extend). samsung-cast is a fork of
-[omarroth/doubletake](https://github.com/omarroth/doubletake) (Go, LGPL-3.0) developed in this
-repo, plus the `samcast` CLI that turns it into a set-and-forget appliance: discovery, pairing,
-daemon lifecycle, Hyprland integration, mirror/extend/toggle.
+as a **second monitor** (extend). samsung-cast is the `samcast` CLI — a set-and-forget appliance:
+discovery, pairing, daemon lifecycle, Hyprland integration, mirror/extend/toggle — built on a
+patched fork of [omarroth/doubletake](https://github.com/omarroth/doubletake) (Go, LGPL-3.0)
+kept in a separate repo (`../doubletake-samsung`).
 
 ## Why this exists
 
@@ -12,16 +12,15 @@ The CU7000 (Tizen 2022) speaks no Miracast and has no Chromecast; its mDNS adver
 AirPlay 2 only (`model=UAU7000`, `_airplay._tcp`). No Linux tool spoke that as a *sender*
 until doubletake (Go, LGPL-3.0): SRP-6a PIN pairing, FairPlay SAP, encrypted H.264/HEVC stream,
 PipeWire/portal capture, GStreamer encoding (VAAPI/NVENC/OpenH264/x264). A Samsung Tizen TV
-(TU8300) is on its tested-devices list. This fork carries the Samsung-specific work directly in
-its tree (see `docs/patches.md`) and adds the `samcast` appliance layer: discovery, pairing,
-daemon lifecycle, config, extend mode, toggle keybind.
+(TU8300) is on its tested-devices list. The fork carries the Samsung-specific receiver work
+(`PATCHES.md` in that repo); samcast adds the appliance layer: discovery, pairing, daemon
+lifecycle, config, extend mode, toggle keybind.
 
 ## Layout
 
 ```
 samcast              CLI: discover / pair / start / on / mirror / extend / off / toggle / status / log
-Makefile             builds the fork, symlinks bin/
-vendor/doubletake    the fork itself, tracked in this repo (base: upstream @ 5e2f1cb)
+Makefile             builds the fork from ../doubletake-samsung (override: make VENDOR=...), symlinks bin/
 bin/                 build output symlinks (not tracked)
 docs/                protocol findings for this TV
 ~/.config/samsung-cast/config   name/FPS/encoder/port-range (written on first run)
@@ -99,7 +98,7 @@ start silently.
 | Extend mode (virtual headless output → scoped portal capture) | ✅ 4K30 HEVC `state: streaming` (4K60 stalls the TV's Wi-Fi) |
 | Audio (ALAC over ChaCha20, follows the system default output) | ✅ |
 
-Patches applied to the fork (`vendor/doubletake`, documented in `docs/patches.md`):
+Patches applied to the fork (documented in `PATCHES.md` in the doubletake-samsung repo):
 `DOUBLETAKE_TIMING=NTP` override — the CU7000 advertises PTP (feature 41) but its SETUP
 response omits `timingPeerInfo.ClockID`, so the PTP media clock can never start
 (same root cause as upstream issue #30, Finding 3) — and `DOUBLETAKE_RESTORE_SCOPE`, which
@@ -132,11 +131,21 @@ monitors.
   speaker volume to 100%; that is firmware behavior with no sender-side fix. Lower the volume
   with the TV remote after casting, or try the TV's Sound → Auto Volume setting.
 - Mirrored audio captures the monitor of whatever the sound server's current
-  default output is (`pulsesrc device=@DEFAULT_MONITOR@`, patch #5 in
-  `docs/patches.md`), resolved at each stream start — no longer pinned to the
+  default output is (`pulsesrc device=@DEFAULT_MONITOR@`, fork `PATCHES.md` #5),
+  resolved at each stream start — no longer pinned to the
   sink that was default when the daemon started (previously
   `echo_cancel_sink.monitor` here). If TV audio is silent, check your default
   output routing in pavucontrol; a routing change applies from the next stream
   start.
 - doubletake upstream disclaimer applies: much of its code was LLM-written, reviewed but not
   security-audited. LAN-only traffic, no inbound TCP, no port forwarding.
+
+## License
+
+samsung-cast is closed source: the `samcast` CLI, docs, and all other contents of this repo are
+Copyright (C) 2026 samsung-cast contributors. All rights reserved.
+
+The build depends on `../doubletake-samsung` (push to GitHub as its own public repo), a modified
+fork of [omarroth/doubletake](https://github.com/omarroth/doubletake) released under the LGPL-3.0
+— see that repo's `LICENSE` and `PATCHES.md`. samcast executes its binaries as a separate process
+and contains none of its code.

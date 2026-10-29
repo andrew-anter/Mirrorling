@@ -1,5 +1,6 @@
 BIN := bin
-VENDOR := vendor/doubletake
+# The LGPL-3.0 doubletake fork lives in its own repo (sibling clone).
+VENDOR ?= ../doubletake-samsung
 
 .PHONY: all build install-user clean
 
