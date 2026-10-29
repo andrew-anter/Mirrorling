@@ -28,6 +28,9 @@ SAMCAST_PORT_RANGE="60000-60010"
 SAMCAST_TIMING="NTP"            # NTP | PTP — CU7000 advertises PTP but SETUP omits ClockID (upstream #30)
 SAMCAST_EXTRA_FLAGS=""          # extra doubletake flags, e.g. "-bitrate 4500 -no-audio"
 SAMCAST_EXTEND_OUTPUT="SAMCAST" # virtual Hyprland output streamed in extend mode
+SAMCAST_EXTEND_MODE="3840x2160@60" # virtual output resolution (TV is 4K; use 1920x1080@60 on weak Wi-Fi)
+SAMCAST_EXTEND_FPS="30"        # extend stream fps — 4K60 can stall the TV's Wi-Fi; raise to 60 on solid 5 GHz
+SAMCAST_EXTEND_CODEC="hevc"    # extend stream codec: hevc unlocks the TV's 4K canvas; h264 = 1080p
 EOF
     echo "samsung-cast: wrote default config to $CONF"
 fi
@@ -38,8 +41,11 @@ source "$CONF"
 # force NTP unless overridden (upstream doubletake issue #30, Finding 3).
 export DOUBLETAKE_TIMING="${SAMCAST_TIMING:-NTP}"
 
-# Extend-mode knob added after this config was first written.
+# Extend-mode knobs added after this config was first written.
 SAMCAST_EXTEND_OUTPUT="${SAMCAST_EXTEND_OUTPUT:-SAMCAST}"
+SAMCAST_EXTEND_MODE="${SAMCAST_EXTEND_MODE:-3840x2160@60}"
+SAMCAST_EXTEND_FPS="${SAMCAST_EXTEND_FPS:-30}"
+SAMCAST_EXTEND_CODEC="${SAMCAST_EXTEND_CODEC:-hevc}"
 
 usage() {
     cat <<EOF
@@ -54,14 +60,16 @@ samsung-cast — mirror or extend this desktop to "$SAMCAST_NAME" (Samsung AirPl
   samcast on [PIN]        start mirroring (same as: samcast mirror)
   samcast mirror [PIN]    mirror the current screen (clone) to the TV
   samcast extend [PIN]    extend: stream a virtual Hyprland output instead —
-                          the TV becomes a second monitor; drag windows onto it
+                          the TV (4K panel) becomes a second monitor at its
+                          native 3840x2160 via HEVC; drag windows onto it
   samcast off             stop mirroring/extending (removes the virtual output)
   samcast toggle          mirror on <-> off (bind this to a Hyprland key)
   samcast devices         devices the daemon can see
   samcast log [-f]        daemon logs (journalctl)
 
 Env overrides after config: SAMCAST_NAME, SAMCAST_FPS, SAMCAST_HWACCEL,
-SAMCAST_PORT_RANGE, SAMCAST_EXTRA_FLAGS, SAMCAST_EXTEND_OUTPUT.
+SAMCAST_PORT_RANGE, SAMCAST_EXTRA_FLAGS, SAMCAST_EXTEND_OUTPUT,
+SAMCAST_EXTEND_MODE, SAMCAST_EXTEND_FPS, SAMCAST_EXTEND_CODEC.
 EOF
 }
 
@@ -121,11 +129,20 @@ cmd_start() {
     else
         local envargs=(--setenv="DOUBLETAKE_TIMING=$DOUBLETAKE_TIMING")
         [ -n "$scope" ] && envargs+=(--setenv="DOUBLETAKE_RESTORE_SCOPE=$scope")
+        # HEVC unlocks this TV's 4K canvas; H.264 caps it at 1080p. Extend
+        # defaults to 30 fps: 4K60 HEVC bursts stall this TV's Wi-Fi link.
+        local codecflags="" fps="$SAMCAST_FPS"
+        if [ "$scope" = "extend" ]; then
+            [ -n "$SAMCAST_EXTEND_FPS" ] && fps="$SAMCAST_EXTEND_FPS"
+            if [ -n "$SAMCAST_EXTEND_CODEC" ] && [ "$SAMCAST_EXTEND_CODEC" != "auto" ]; then
+                codecflags="-video-codec $SAMCAST_EXTEND_CODEC"
+            fi
+        fi
         # shellcheck disable=SC2086
         systemd-run --user --unit="$UNIT" "${envargs[@]}" \
             --description="samsung-cast AirPlay $desc daemon" \
             "$DOUBLETAKE" -daemonize -port-range "$SAMCAST_PORT_RANGE" \
-            -fps "$SAMCAST_FPS" -hwaccel "$SAMCAST_HWACCEL" $SAMCAST_EXTRA_FLAGS
+            -fps "$fps" -hwaccel "$SAMCAST_HWACCEL" $codecflags $SAMCAST_EXTRA_FLAGS
     fi
     printf '%s\n' "${scope:-mirror}" > "$MODE_FILE" 2>/dev/null || true
     for _ in $(seq 1 40); do [ -S "$SOCK" ] && break; sleep 0.25; done
@@ -167,19 +184,41 @@ require_hyprland() {
     [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ] || die "extend mode needs a running Hyprland session"
 }
 
-# Create the virtual (headless) Hyprland output streamed in extend mode.
-# It comes up 1920x1080@60 right of the last real monitor — the TV's AirPlay
-# canvas — and keeps a fixed name so the portal restore token stays valid.
+# Current resolution ("WxH") of a monitor, empty if absent.
+output_width_height() {
+    hyprctl monitors 2>/dev/null | awk -v o="$1" '
+        $1 == "Monitor" && $2 == o { grab = 1; next }
+        grab && /@/ { split($1, m, "@"); print m[1]; exit }'
+}
+
+# Create the virtual (headless) Hyprland output streamed in extend mode and
+# force its mode to $SAMCAST_EXTEND_MODE (4K for this TV). Hyprland 0.56
+# cannot set headless modes at runtime via hyprctl (keyword monitor is
+# rejected and config lines do not apply to created headless outputs), so a
+# non-default mode needs wlr-randr (wlr-output-management).
 ensure_extend_output() {
-    hyprctl monitors 2>/dev/null | grep -Fq "$SAMCAST_EXTEND_OUTPUT (" && return 0
-    hyprctl output create headless "$SAMCAST_EXTEND_OUTPUT" >/dev/null \
-        || die "cannot create headless output '$SAMCAST_EXTEND_OUTPUT'"
-    local _
-    for _ in $(seq 1 20); do
-        hyprctl monitors 2>/dev/null | grep -Fq "$SAMCAST_EXTEND_OUTPUT (" && return 0
-        sleep 0.25
-    done
-    die "headless output '$SAMCAST_EXTEND_OUTPUT' did not appear (hyprctl monitors)"
+    if ! hyprctl monitors 2>/dev/null | grep -Fq "$SAMCAST_EXTEND_OUTPUT ("; then
+        hyprctl output create headless "$SAMCAST_EXTEND_OUTPUT" >/dev/null \
+            || die "cannot create headless output '$SAMCAST_EXTEND_OUTPUT'"
+        local _
+        for _ in $(seq 1 20); do
+            hyprctl monitors 2>/dev/null | grep -Fq "$SAMCAST_EXTEND_OUTPUT (" && break
+            sleep 0.25
+        done
+        hyprctl monitors 2>/dev/null | grep -Fq "$SAMCAST_EXTEND_OUTPUT (" \
+            || die "headless output '$SAMCAST_EXTEND_OUTPUT' did not appear (hyprctl monitors)"
+    fi
+    local cur want="${SAMCAST_EXTEND_MODE%%@*}"
+    cur="$(output_width_height "$SAMCAST_EXTEND_OUTPUT")"
+    [ "$cur" = "$want" ] && return 0
+    if command -v wlr-randr >/dev/null 2>&1; then
+        wlr-randr --output "$SAMCAST_EXTEND_OUTPUT" --custom-mode "$SAMCAST_EXTEND_MODE" >/dev/null 2>&1 \
+            || wlr-randr --output "$SAMCAST_EXTEND_OUTPUT" --mode "$SAMCAST_EXTEND_MODE" >/dev/null 2>&1 || true
+        sleep 0.5
+        cur="$(output_width_height "$SAMCAST_EXTEND_OUTPUT")"
+    fi
+    [ "$cur" = "$want" ] || die "output '$SAMCAST_EXTEND_OUTPUT' is ${cur:-unknown}, want $want.
+Install wlr-randr (sudo pacman -S wlr-randr) or set SAMCAST_EXTEND_MODE=1920x1080@60 in $CONF"
 }
 
 remove_extend_output() {

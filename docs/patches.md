@@ -57,6 +57,9 @@ ever). Covered by `credentials_scope_test.go`.
 
 ## Not patched (observed, non-fatal)
 
-- `SET_PARAMETER volume` → HTTP 500 on this firmware; doubletake logs it as non-fatal.
+- `SET_PARAMETER volume` → HTTP 500 on this firmware — unfixable sender-side. Confirmed
+  mid-session on a live 4K HEVC stream (daemon `mute` → `set audio muted=true: HTTP 500`).
+  The TV resets its speaker volume to 100% when an AirPlay session closes; that is Tizen
+  session-end behavior, not something the sender triggers.
 - H.264 NAL type 12 (filler) units are ignored by the stream packer (expected).
 - `[EVENT] channel` quirks seen on other receivers were not observed here.

@@ -32,7 +32,8 @@ docs/                protocol findings for this TV
 ```sh
 sudo pacman -S --needed gstreamer gst-plugins-base gst-plugins-good \
                         gst-plugins-bad gst-plugins-ugly gst-libav   # encoder runtime
-cd ~/projects/samsung-cast && make                                 # ~6 s Go build
+sudo pacman -S --needed wlr-randr                              # extend mode (headless output 4K mode)
+cd ~/projects/samsung-cast && make                                 # Go build
 ```
 
 Then pair once — **a PIN appears on the TV**, type it into the prompt:
@@ -48,8 +49,8 @@ the laptop or you change its settings.
 
 ```sh
 ./samcast on        # start daemon (systemd-run --user, unit "samsung-cast") + mirror
-./samcast extend    # TV as a second monitor: streams a virtual Hyprland output
-                    # (1080p60 right of your panel); drag windows onto it.
+./samcast extend    # TV (4K panel) becomes a second monitor: virtual output at
+                    # 3840x2160@30 via HEVC; drag windows onto it.
                     # First time only, the share picker pops — choose "SAMCAST".
 ./samcast off       # stop mirroring/extending (removes the virtual output)
 ./samcast toggle    # one-key switch — bind it in Hyprland:
@@ -59,9 +60,12 @@ the laptop or you change its settings.
 ./samcast stop      # stop the daemon entirely
 ```
 
-Extend mode creates a headless Hyprland output named `SAMCAST` (`hyprctl output create headless`)
-and the daemon captures that instead of your panel; switching modes restarts the daemon with a
-different portal restore-token scope, so mirror and extend each remember their monitor silently.
+Extend mode creates a headless Hyprland output named `SAMCAST` and forces it to
+`SAMCAST_EXTEND_MODE` (4K — the TV's native panel — via `wlr-randr`), then streams it with
+HEVC, which unlocks the TV's 4K AirPlay canvas (H.264 caps the canvas at 1080p). The TV
+becomes a real second monitor; drag windows or workspaces onto it. Switching modes restarts
+the daemon with a different portal restore-token scope, so mirror and extend each remember
+their monitor silently.
 
 First run of each mode pops the Hyprland screen-share picker once — mirror remembers your
 panel, extend remembers the `SAMCAST` output (separate restore tokens); after that, streams
@@ -80,6 +84,9 @@ start silently.
 | `SAMCAST_TIMING` | `NTP` | `NTP`/`PTP`; CU7000 needs NTP (see patches note below) |
 | `SAMCAST_EXTRA_FLAGS` | — | passed through, e.g. `"-bitrate 4500 -no-audio"` |
 | `SAMCAST_EXTEND_OUTPUT` | `SAMCAST` | name of the virtual Hyprland output streamed in extend mode |
+| `SAMCAST_EXTEND_MODE` | `3840x2160@60` | virtual output resolution; needs `wlr-randr` for non-default modes |
+| `SAMCAST_EXTEND_FPS` | `30` | extend stream fps — 4K60 HEVC stalls this TV's Wi-Fi; raise on solid 5 GHz |
+| `SAMCAST_EXTEND_CODEC` | `hevc` | extend stream codec — HEVC unlocks this TV's 4K canvas; `h264` caps it at 1080p |
 
 ## Status (verified on this machine, 2026-10-29)
 
@@ -89,7 +96,7 @@ start silently.
 | Discovery + model/firmware decode | ✅ live |
 | Pairing (PIN on TV, SRP over HAP type 3) | ✅ credentials saved at `~/.config/doubletake/credentials.json` |
 | Mirroring (portal capture → NVENC → encrypted H.264, NTP timing) | ✅ `state: streaming` |
-| Extend mode (virtual headless output → scoped portal capture) | 🚧 implemented; verified to the `connect` step — TV was off, first live run pending |
+| Extend mode (virtual headless output → scoped portal capture) | ✅ 4K30 HEVC `state: streaming` (4K60 stalls the TV's Wi-Fi) |
 | Audio (ALAC over ChaCha20, from `echo_cancel_sink.monitor`) | ✅ |
 
 Patches applied to the fork (`vendor/doubletake`, documented in `docs/patches.md`):
@@ -104,6 +111,11 @@ monitors.
 - Extend mode adds a real (headless) monitor to the session: Hyprland focuses it on creation,
   and `off`/`stop` remove it. If the share picker appears again after a removal, choose
   `SAMCAST` once — portal restore tokens can lapse when the output is recreated.
+- A stream that drops seconds after start with `broadcast sink backlog limit exceeded` was hit
+  by a >250 ms send stall (Wi-Fi hiccup); doubletake disconnects the receiver by design. Just
+  rerun `samcast extend`/`on`.
+- 4K60 extend wants solid Wi-Fi; if it stutters or drops, set `SAMCAST_FPS=30` or
+  `SAMCAST_EXTEND_MODE=1920x1080@60` in the config.
 - TV standby kills the cast path (no Wi-Fi) — power the screen first.
 - **The on-TV PIN expires fast**: entering it ~45 s after it appears gives SRP `M4 error: 2`
   (auth failure); ~17 s works. Re-run `samcast pair` and enter the code immediately. Once paired,
@@ -113,9 +125,12 @@ monitors.
 - ~75–85 ms added latency (auto wireless profile): fine for video/browsing, not gaming.
 - DRM players (Netflix in a browser) render black — portal capture can't grab protected surfaces.
 - Default stream canvas is the receiver's AirPlay nominal (1920x1080 H.264), max 3840x2160/4k60;
-  `-video-codec hevc` experimentally unlocks the 4K canvas (untested here).
-- `SET_PARAMETER volume` gets HTTP 500 from this firmware — volume control unsupported
-  (non-fatal, logged once per session; control TV volume with its remote).
+  extend mode uses `-video-codec hevc` to unlock the 4K canvas (verified at 4K30; 4K60 stalls
+  the TV's Wi-Fi link with `writev i/o timeout`).
+- `SET_PARAMETER volume` is rejected by this firmware (HTTP 500) — the sender cannot set TV
+  volume at all (verified live mid-session). When an AirPlay session closes, Tizen resets its
+  speaker volume to 100%; that is firmware behavior with no sender-side fix. Lower the volume
+  with the TV remote after casting, or try the TV's Sound → Auto Volume setting.
 - Mirrored audio comes from `echo_cancel_sink.monitor` (doubletake picks the monitor of the
   default sink — here the PipeWire echo-cancel sink). If TV audio is silent, check your default
   output routing in pavucontrol.
