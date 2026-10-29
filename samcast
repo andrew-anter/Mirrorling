@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# samsung-cast: wireless desktop mirroring from this laptop to the Samsung
+# 58CU7000 (Tizen AirPlay 2) via omarroth/doubletake.
+#
+# Config: ~/.config/samsung-cast/config (sourced shell, written on first run)
+# Logs:   journalctl --user -u samsung-cast
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DOUBLETAKE="$SCRIPT_DIR/bin/doubletake"
+CTL="$SCRIPT_DIR/bin/doubletake-ctl"
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/samsung-cast"
+CONF="$CONF_DIR/config"
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+SOCK="$RUNTIME_DIR/doubletake.sock"
+UNIT="samsung-cast"
+
+# First run: write a config with working defaults for this TV.
+if [ ! -f "$CONF" ]; then
+    mkdir -p "$CONF_DIR"
+    cat > "$CONF" <<'EOF'
+# samsung-cast configuration (sourced by samcast)
+SAMCAST_NAME="Sam58"            # mDNS service name of the TV (see: samcast discover)
+SAMCAST_FPS=60                  # capture frame rate (30 saves Wi-Fi bandwidth)
+SAMCAST_HWACCEL=auto            # auto | vaapi | nvenc | openh264 | none
+SAMCAST_PORT_RANGE="60000-60010"
+SAMCAST_TIMING="NTP"            # NTP | PTP — CU7000 advertises PTP but SETUP omits ClockID (upstream #30)
+SAMCAST_EXTRA_FLAGS=""          # extra doubletake flags, e.g. "-bitrate 4500 -no-audio"
+EOF
+    echo "samsung-cast: wrote default config to $CONF"
+fi
+# shellcheck source=/dev/null
+source "$CONF"
+
+# Samsung Tizen advertises PTP but its SETUP omits timingPeerInfo.ClockID —
+# force NTP unless overridden (upstream doubletake issue #30, Finding 3).
+export DOUBLETAKE_TIMING="${SAMCAST_TIMING:-NTP}"
+
+usage() {
+    cat <<EOF
+samsung-cast — mirror this desktop to "$SAMCAST_NAME" (Samsung AirPlay 2)
+
+  samcast discover        list Samsung AirPlay receivers on the LAN
+  samcast target          print resolved TV IP
+  samcast pair            first-time pairing (PIN appears on the TV)
+  samcast start           start the background daemon (systemd-run --user)
+  samcast stop            stop the daemon
+  samcast status          daemon + stream status
+  samcast on [PIN]        start mirroring to the TV
+  samcast off             stop mirroring
+  samcast toggle          on <-> off (bind this to a Hyprland key)
+  samcast devices         devices the daemon can see
+  samcast log [-f]        daemon logs (journalctl)
+
+Env overrides after config: SAMCAST_NAME, SAMCAST_FPS, SAMCAST_HWACCEL,
+SAMCAST_PORT_RANGE, SAMCAST_EXTRA_FLAGS.
+EOF
+}
+
+die() { echo "samsung-cast: $*" >&2; exit 1; }
+
+# Resolve the TV's IP + AirPlay port from mDNS (avahi). TV must be powered on.
+# Sets TARGET_IP and TARGET_PORT (Samsung picks a dynamic AirPlay port, e.g. 51820, not 7000).
+resolve_target() {
+    local out
+    out="$(avahi-browse -rt _airplay._tcp -t 2>/dev/null | awk -v n="$SAMCAST_NAME" '
+        $1 == "=" && $4 == n { grab = 1; next }
+        grab && /address =/ { gsub(/[][]/, ""); sub(/^.*address = /, ""); ip = $0 }
+        grab && /port =/    { gsub(/[][]/, ""); sub(/^.*port = /, "");    port = $0 }
+        grab && ip != "" && port != "" { print ip, port; exit }')"
+    [ -n "$out" ] || die "'$SAMCAST_NAME' not found on the network (is the TV on and on Wi-Fi?)"
+    TARGET_IP="${out% *}"; TARGET_PORT="${out#* }"
+}
+
+stream_flags() {
+    printf -- '-fps %s -hwaccel %s -port-range %s %s' \
+        "$SAMCAST_FPS" "$SAMCAST_HWACCEL" "$SAMCAST_PORT_RANGE" "$SAMCAST_EXTRA_FLAGS"
+}
+
+cmd_discover() {
+    echo "Samsung AirPlay receivers on this network:"
+    avahi-browse -rt _airplay._tcp -t 2>/dev/null | awk '
+        $1 == "=" { name = $4; next }
+        name == "" { next }
+        /address =/ { gsub(/[][]/, ""); sub(/^.*address = /, ""); addr[name] = $0; next }
+        match($0, /model=[^"]+/) { model[name] = substr($0, RSTART + 6, RLENGTH - 6) }
+        match($0, /fv=[^"]+/)    { fw[name]    = substr($0, RSTART + 3, RLENGTH - 3) }
+        END {
+            for (n in addr)
+                if (model[n] ~ /^U/)   # Samsung consumer models start with U (UAU7000, UE*, UN*, ...)
+                    printf "  %-10s %-15s model=%-10s fw=%s\n", n, addr[n], model[n], fw[n]
+        }'
+}
+
+cmd_target() { resolve_target; echo "$TARGET_IP:$TARGET_PORT"; }
+
+cmd_pair() {
+    resolve_target
+    echo "Pairing with $SAMCAST_NAME ($TARGET_IP:$TARGET_PORT). Check the TV for the PIN."
+    # shellcheck disable=SC2086
+    exec "$DOUBLETAKE" -target "$TARGET_IP" -port "$TARGET_PORT" -pair $(stream_flags)
+}
+
+cmd_start() {
+    if systemctl --user is-active --quiet "$UNIT"; then
+        echo "daemon already running"
+    else
+        # shellcheck disable=SC2086
+        systemd-run --user --unit="$UNIT" --setenv=DOUBLETAKE_TIMING="$DOUBLETAKE_TIMING" \
+            --description="samsung-cast AirPlay mirroring daemon" \
+            "$DOUBLETAKE" -daemonize -port-range "$SAMCAST_PORT_RANGE" \
+            -fps "$SAMCAST_FPS" -hwaccel "$SAMCAST_HWACCEL" $SAMCAST_EXTRA_FLAGS
+    fi
+    for _ in $(seq 1 40); do [ -S "$SOCK" ] && break; sleep 0.25; done
+    [ -S "$SOCK" ] || die "daemon socket $SOCK never appeared (journalctl --user -u $UNIT)"
+    "$CTL" status
+}
+
+cmd_stop()   { "$CTL" disconnect 2>/dev/null || true; systemctl --user stop "$UNIT" 2>/dev/null || true; echo "stopped"; }
+cmd_status() { "$CTL" status 2>/dev/null || die "daemon not running (samcast start)"; }
+cmd_devices(){ "$CTL" devices 2>/dev/null || die "daemon not running (samcast start)"; }
+
+cmd_on() {
+    resolve_target
+    [ "$(systemctl --user is-active "$UNIT" 2>/dev/null || true)" = "active" ] || cmd_start
+    # The daemon resolves the AirPlay port from its own mDNS cache; wait until
+    # the TV shows up there (a freshly started daemon needs a few seconds).
+    for _ in $(seq 1 40); do
+        "$CTL" devices 2>/dev/null | grep -Fq "$TARGET_IP" && break
+        sleep 0.5
+    done
+    echo "Mirroring to $SAMCAST_NAME ($TARGET_IP:$TARGET_PORT)..."
+    # shellcheck disable=SC2086
+    if [ $# -gt 0 ]; then "$CTL" connect "$TARGET_IP" "$1"; else "$CTL" connect "$TARGET_IP"; fi
+}
+
+cmd_off()     { "$CTL" disconnect 2>/dev/null || true; echo "mirroring stopped"; }
+
+cmd_toggle() {
+    resolve_target
+    if "$CTL" status 2>/dev/null | grep -Fq "$TARGET_IP"; then cmd_off; else cmd_on; fi
+}
+
+cmd_log() { journalctl --user -u "$UNIT" "$@"; }
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+    discover) cmd_discover ;;
+    target)   cmd_target ;;
+    pair)     cmd_pair ;;
+    start)    cmd_start ;;
+    stop)     cmd_stop ;;
+    status)   cmd_status ;;
+    devices)  cmd_devices ;;
+    on)       cmd_on "$@" ;;
+    off)      cmd_off ;;
+    toggle)   cmd_toggle ;;
+    log)      cmd_log "$@" ;;
+    *)        usage; [ "$cmd" = "" ] || die "unknown command: $cmd" ;;
+esac
