@@ -164,6 +164,40 @@ The panel reads the CLI's machine-readable modes (handy in scripts too): `samcas
 nothing is discovered — while `samcast tv --raw` prints the configured TV name and
 `samcast monitor --raw` prints the pinned monitor or `auto`.
 
+## Single-file build
+
+`make app` produces `dist/samcast` — ONE static x86-64 executable carrying the whole appliance:
+the `samcast` CLI, `samcast-picker`, the fork's static `doubletake`/`doubletake-ctl`, and the
+control-panel server. Copy it anywhere (`~/.local/bin`, another machine) — no repo checkout
+needed. On first run it unpacks itself to `~/.cache/samsung-cast/app-<hash>` and from then on
+behaves exactly like the `samcast` CLI, except **no arguments means `samcast ui`** (the file IS
+the app, so it opens the control panel):
+
+```sh
+make app
+install -m755 dist/samcast ~/.local/bin/samcast
+samcast version    # print the image hash + extraction dir
+samcast            # opens the control panel; samcast on/off/toggle/... all work as usual
+```
+
+The extraction is content-hashed (`samcast version`): a rebuilt image with any changed byte
+unpacks to its own directory, so a stale extraction never shadows a newer one.
+
+Runtime dependencies are NOT bundled (the engine execs them at cast time):
+
+```sh
+# Debian trixie
+sudo apt install gstreamer1.0-tools gstreamer1.0-plugins-base \
+                 gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+                 avahi-utils        # and enable avahi-daemon
+# Arch
+sudo pacman -S --needed gstreamer gst-plugins-base gst-plugins-good \
+                        gst-plugins-bad gst-plugins-ugly gst-libav avahi
+```
+
+On Wayland/Hyprland, monitor picking needs `xdg-desktop-portal-hyprland` (same package name on
+Debian), and Wayland capture also needs PipeWire.
+
 ## Tuning
 
 `~/.config/samsung-cast/config` (sourced by `samcast`):

@@ -1,0 +1,196 @@
+// samcast single-file launcher: one static binary carrying the whole
+// samsung-cast appliance (samcast CLI, samcast-picker, bin/doubletake,
+// bin/doubletake-ctl, bin/samcast-ui) as an embedded archive, staged by
+// `make app`. On first run it unpacks itself into the user's cache and execs
+// the real CLI from there; later runs reuse that tree, keyed by a content
+// hash so a changed image always extracts fresh.
+//
+// Trust model: this file is code+data for one user, unpacked into that user's
+// own cache and executed as that user — treat the binary exactly like the
+// scripts it replaces; it confers no privilege the user did not already have.
+package main
+
+import (
+	"crypto/sha256"
+	"embed"
+	"encoding/hex"
+	"fmt"
+	"io/fs"
+	"os"
+	"os/exec"
+	"os/user"
+	"path/filepath"
+	"sort"
+	"strings"
+	"syscall"
+)
+
+//go:embed all:assets
+var assets embed.FS
+
+const (
+	brand = "samsung-cast"
+	// app/assets/.gitignore is only the embed anchor for a not-yet-staged
+	// tree — not part of the appliance, so it is neither hashed nor extracted.
+	anchor = ".gitignore"
+)
+
+func die(f string, a ...any) {
+	fmt.Fprintf(os.Stderr, "samcast: "+f+"\n", a...)
+	os.Exit(1)
+}
+
+// assetList returns the embedded asset paths (assets/-relative), sorted.
+func assetList() []string {
+	var names []string
+	err := fs.WalkDir(assets, "assets", func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() && d.Name() != anchor {
+			names = append(names, p)
+		}
+		return nil
+	})
+	if err != nil {
+		die("reading embedded assets: %v", err)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// imageHash fingerprints every asset's path + bytes; its first 12 hex chars
+// name the extraction directory, so any changed byte picks a fresh one.
+func imageHash() string {
+	h := sha256.New()
+	for _, name := range assetList() {
+		data, err := assets.ReadFile(name)
+		if err != nil {
+			die("reading embedded asset %s: %v", name, err)
+		}
+		h.Write([]byte(name))
+		h.Write([]byte{0})
+		h.Write(data)
+	}
+	return hex.EncodeToString(h.Sum(nil)[:6])
+}
+
+func cacheDir() string {
+	if c := os.Getenv("XDG_CACHE_HOME"); c != "" {
+		return c
+	}
+	if h := os.Getenv("HOME"); h != "" {
+		return filepath.Join(h, ".cache")
+	}
+	if u, err := user.Current(); err == nil && u.HomeDir != "" {
+		return filepath.Join(u.HomeDir, ".cache")
+	}
+	die("no home directory ($HOME unset, no passwd entry) — cannot find the cache")
+	return ""
+}
+
+// extract unpacks the appliance into a sibling temp dir and renames it into
+// place. The rename onto an existing non-empty dir is the concurrent-first-run
+// guard: a rival extraction of the same image wins and ours is discarded.
+func extract(dir, hash string) {
+	tmp := filepath.Join(filepath.Dir(dir), fmt.Sprintf("app-%s.tmp-%d", hash, os.Getpid()))
+	defer os.RemoveAll(tmp) // no-op once tmp has been renamed away
+	if err := os.MkdirAll(tmp, 0o755); err != nil {
+		die("creating %s: %v", tmp, err)
+	}
+	for _, name := range assetList() {
+		data, err := assets.ReadFile(name)
+		if err != nil {
+			die("reading embedded asset %s: %v", name, err)
+		}
+		rel, err := filepath.Rel("assets", name)
+		if err != nil {
+			die("bad asset path %s: %v", name, err)
+		}
+		dst := filepath.Join(tmp, rel)
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			die("creating %s: %v", filepath.Dir(dst), err)
+		}
+		if err := os.WriteFile(dst, data, 0o755); err != nil {
+			die("writing %s: %v", dst, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(tmp, ".stamp"), []byte(hash), 0o644); err != nil {
+		die("writing stamp: %v", err)
+	}
+	if err := os.Rename(tmp, dir); err != nil {
+		if stamp, rerr := os.ReadFile(filepath.Join(dir, ".stamp")); rerr == nil && string(stamp) == hash {
+			return // concurrent first run of the same image got there first
+		}
+		die("extracting to %s: %v", dir, err)
+	}
+}
+
+// sniff warns (never blocks) about the engine's exec'd runtime deps, one
+// stderr line each, with the install hint for the running distro.
+func sniff() {
+	for _, dep := range []struct{ bin, deb, other string }{
+		{"gst-launch-1.0",
+			"apt install gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad",
+			"pacman -S gstreamer"},
+		{"avahi-browse",
+			"apt install avahi-utils (and enable avahi-daemon)",
+			"pacman -S avahi (and enable avahi-daemon)"},
+	} {
+		if _, err := exec.LookPath(dep.bin); err != nil {
+			if debianish() {
+				dep.other = dep.deb
+			}
+			fmt.Fprintf(os.Stderr, "samcast: %s not found on PATH — casting needs it: %s\n", dep.bin, dep.other)
+		}
+	}
+}
+
+// debianish reports a Debian-family distro (apt hints) vs everything else
+// (pacman), via ID/ID_LIKE in /etc/os-release.
+func debianish() bool {
+	data, err := os.ReadFile("/etc/os-release")
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		key, value, found := strings.Cut(line, "=")
+		if found && (key == "ID" || key == "ID_LIKE") && strings.Contains(strings.ToLower(value), "debian") {
+			return true
+		}
+	}
+	return false
+}
+
+func main() {
+	// `go build` inside app/ without `make app`'s staging embeds only the
+	// anchor — fail with the fix instead of a cryptic exec error later.
+	if len(assetList()) == 0 {
+		die("no embedded assets staged — build the image with: make app")
+	}
+	hash := imageHash()
+	dir := filepath.Join(cacheDir(), brand, "app-"+hash)
+
+	// A valid .stamp short-circuits the extraction on every later run.
+	if stamp, err := os.ReadFile(filepath.Join(dir, ".stamp")); err != nil || string(stamp) != hash {
+		extract(dir, hash)
+	}
+
+	args := os.Args[1:]
+	if len(args) == 0 {
+		args = []string{"ui"} // this file IS the app: no arguments opens the control panel
+	}
+	if args[0] == "version" { // intercepted: identify the image, never reaches the CLI
+		fmt.Printf("samcast image %s\n%s\n", hash, dir)
+		return
+	}
+
+	sniff()
+
+	cli := filepath.Join(dir, "samcast")
+	// Exec replaces this process: signals/Ctrl-C behave exactly as under the
+	// plain bash CLI.
+	if err := syscall.Exec(cli, append([]string{cli}, args...), os.Environ()); err != nil {
+		die("exec %s: %v", cli, err)
+	}
+}
