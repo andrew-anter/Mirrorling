@@ -92,24 +92,34 @@
   /* ---------- hero: the link line + the one big button ---------- */
   .beam { display: flex; align-items: flex-end; gap: 12px; padding: 34px 4px 6px; color: var(--faint); }
   .beam svg { width: 38px; height: 26px; flex: none; stroke: currentColor; }
-  .beam .track { position: relative; flex: 1; height: 2px; margin-bottom: 12px; }
+  .beam .track { position: relative; flex: 1; height: 2px; margin-bottom: 12px; overflow-x: clip; }
   .beam .line {
     position: absolute; inset: 0;
     background: repeating-linear-gradient(90deg, var(--seam) 0 6px, transparent 6px 13px);
   }
   .beam .flow {
-    position: absolute; top: -1px; height: 4px; width: 34%;
-    background: linear-gradient(90deg, transparent, var(--amber), transparent);
+    position: absolute; top: -1px; height: 4px; width: 34%; --w: 34%;
+    background: linear-gradient(90deg, transparent, var(--amber));
     animation: cast-x 1.3s linear infinite;
     display: none;
   }
   .beam .sheen {
-    position: absolute; top: -1px; height: 4px; width: 26%;
-    background: linear-gradient(90deg, transparent, var(--green), transparent);
+    position: absolute; top: -1px; height: 4px; width: 26%; --w: 26%;
+    background: linear-gradient(90deg, transparent, var(--green));
     animation: cast-x 2.4s linear infinite;
     display: none;
   }
-  @keyframes cast-x { from { left: -34%; } to { left: 100%; } }
+  /* A comet: bright head, fading tail. Its head starts at the track's left
+     edge (the machine icon) while the body is still hidden — it departs FROM
+     the machine — and its own width is subtracted from 100% on arrival so the
+     head lands exactly on the TV icon and is absorbed there, never spilling
+     past it. Opacity fades bookend the run instead of teleporting. */
+  @keyframes cast-x {
+    from { left: calc(-1 * var(--w)); opacity: 0; }
+    12%  { opacity: 1; }
+    80%  { opacity: 1; }
+    to   { left: calc(100% - var(--w)); opacity: 0; }
+  }
   .beam[data-state="down"] svg { opacity: 0.4; }
   .beam[data-state="down"] .track { opacity: 0.3; }
   .beam[data-state="discovering"] .flow,
