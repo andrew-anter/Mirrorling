@@ -30,6 +30,7 @@ SAMCAST_HWACCEL=auto            # auto | vaapi | nvenc | openh264 | none
 SAMCAST_PORT_RANGE="60000-60010"
 SAMCAST_TIMING="NTP"            # NTP | PTP — CU7000 advertises PTP but SETUP omits ClockID (upstream #30)
 SAMCAST_EXTRA_FLAGS=""          # extra doubletake flags, e.g. "-bitrate 4500 -no-audio"
+SAMCAST_MONITOR=""              # monitor to cast ("" = picker dialog per cast; see: samcast monitor / samcast monitors)
 EOF
     echo "samsung-cast: wrote default config to $CONF"
 fi
@@ -39,6 +40,9 @@ source "$CONF"
 # Samsung Tizen advertises PTP but its SETUP omits timingPeerInfo.ClockID —
 # force NTP unless overridden (upstream doubletake issue #30, Finding 3).
 export DOUBLETAKE_TIMING="${SAMCAST_TIMING:-NTP}"
+
+# Configs written before monitor selection predate this key.
+SAMCAST_MONITOR="${SAMCAST_MONITOR:-}"
 
 usage() {
     cat <<EOF
@@ -55,14 +59,43 @@ samsung-cast — mirror this desktop to "$SAMCAST_NAME" (Samsung AirPlay 2)
   samcast off             stop mirroring
   samcast toggle          mirror on <-> off (bind this to a key)
   samcast devices         devices the daemon can see
+  samcast monitors        list connectable monitors (Hyprland outputs / X11 screens)
+  samcast monitor [NAME|auto]
+                          show or set the monitor to cast (auto = picker dialog per cast)
   samcast log [-f]        daemon logs (journalctl)
 
 Env overrides after config: SAMCAST_NAME, SAMCAST_FPS, SAMCAST_HWACCEL,
-SAMCAST_PORT_RANGE, SAMCAST_EXTRA_FLAGS.
+SAMCAST_PORT_RANGE, SAMCAST_EXTRA_FLAGS, SAMCAST_MONITOR.
 EOF
 }
 
 die() { echo "samsung-cast: $*" >&2; exit 1; }
+
+# Persist KEY="VALUE" in $CONF: sed-replace the existing line, append when the
+# key is missing (configs written before a feature predate its variable).
+# Callers validate VALUE (monitor names are ^[A-Za-z0-9_-]+$ or empty), so no
+# sed metacharacters can sneak in.
+set_config_var() {
+    local key="$1" value="$2"
+    if grep -q "^${key}=" "$CONF"; then
+        sed -i "s|^${key}=.*|${key}=\"${value}\"|" "$CONF"
+    else
+        printf '%s="%s"\n' "$key" "$value" >> "$CONF"
+    fi
+}
+
+# Capture-capable monitor names, one per line, on stdout. Wayland/Hyprland is
+# the primary target (names are Hyprland outputs; hyprctl missing/failing
+# there is terminal — no xrandr guesswork); xrandr covers the X11 fallback.
+# Neither session → print nothing, caller decides. The space in `/ connected/`
+# keeps xrandr's "disconnected" from matching.
+list_monitors() {
+    if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+        hyprctl monitors 2>/dev/null | awk '$1=="Monitor"{print $2}' || true
+    elif [ -n "${DISPLAY:-}" ]; then
+        xrandr --query 2>/dev/null | awk '/ connected/ {print $1}' || true
+    fi
+}
 
 # Resolve the TV's IP + AirPlay port from mDNS (avahi). TV must be powered on.
 # Sets TARGET_IP and TARGET_PORT (Samsung picks a dynamic AirPlay port, e.g. 51820, not 7000).
@@ -106,12 +139,99 @@ cmd_pair() {
     exec "$DOUBLETAKE" -target "$TARGET_IP" -port "$TARGET_PORT" -pair $(stream_flags)
 }
 
+# Keep xdg-desktop-portal-hyprland casting headlessly: point its
+# `custom_picker_binary` at our samcast-picker. xdph reads xdph.conf only at
+# portal startup — hence the service restart below, and only when the file
+# content actually changed (the picker itself re-reads the config per cast, so
+# monitor changes never need a restart). Never clobbers a key pointing
+# somewhere else.
+ensure_picker() {
+    local key="screencopy:custom_picker_binary"
+    local want="$SCRIPT_DIR/samcast-picker"
+    local dir="${XDG_CONFIG_HOME:-$HOME/.config}/hypr"
+    local conf="$dir/xdph.conf" have=""
+
+    [ -n "${WAYLAND_DISPLAY:-}" ] || return 0  # X11 fallback: no xdph involved
+    [ -x "$want" ] || {
+        echo "samsung-cast: warning: $want missing or not executable — leaving $conf alone" >&2
+        return 0
+    }
+
+    if [ -f "$conf" ]; then
+        have="$(grep -m1 "^${key}[[:space:]]*=" "$conf" 2>/dev/null |
+            sed 's/^[^=]*=[[:space:]]*//;s/[[:space:]]*$//' || true)"
+        if [ "$have" = "$want" ]; then
+            return 0  # already ours — nothing to do
+        fi
+        if [ -n "$have" ]; then
+            echo "samsung-cast: warning: $conf already sets $key to '$have' — not clobbering it" >&2
+            return 0
+        fi
+        printf '%s = %s\n' "$key" "$want" >> "$conf"  # someone else's file: append ours
+    else
+        mkdir -p "$dir"
+        {
+            echo "# samsung-cast manages the ${key} key below (headless cast picker; see: samcast monitor)"
+            printf '%s = %s\n' "$key" "$want"
+        } > "$conf"
+    fi
+    echo "samsung-cast: set $key in $conf — restarting xdg-desktop-portal-hyprland.service"
+    systemctl --user restart xdg-desktop-portal-hyprland.service 2>/dev/null ||
+        echo "samsung-cast: warning: restarting xdg-desktop-portal-hyprland.service failed — log out/in or restart it" >&2
+}
+
+# First-cast terminal prompt: with several monitors connected and none
+# configured, ask once and persist the answer, so later casts (and the xdph
+# picker) stay dialog-free. No-op when not a terminal, ≤1 monitor, or already
+# configured — keybinding-safe.
+select_monitor() {
+    if [ -n "$SAMCAST_MONITOR" ] || [ ! -t 0 ]; then
+        return 0
+    fi
+    local names name count=0 i=1 pick chosen
+    local -a opts=()
+    names="$(list_monitors)"
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        opts+=("$name")
+        count=$((count + 1))
+    done <<<"$names"
+    if [ "$count" -lt 2 ]; then
+        return 0
+    fi
+    echo "More than one monitor connected — pick the one to cast:"
+    for name in "${opts[@]}"; do
+        printf '  [%d] %s\n' "$i" "$name"
+        i=$((i + 1))
+    done
+    if ! read -r -p "Monitor to cast [1]: " pick; then
+        return 0  # stdin closed mid-prompt — stay on auto
+    fi
+    [ -n "$pick" ] || pick=1  # empty answer takes the default
+    if [ "$pick" -eq "$pick" ] 2>/dev/null && [ "$pick" -ge 1 ] && [ "$pick" -le "$count" ]; then
+        chosen="${opts[$((pick - 1))]}"
+    else
+        echo "samsung-cast: '$pick' is not a menu option — keeping auto" >&2
+        return 0
+    fi
+    set_config_var SAMCAST_MONITOR "$chosen"
+    SAMCAST_MONITOR="$chosen"
+    echo "will cast '$chosen' (change: samcast monitor <NAME>; revert: samcast monitor auto)"
+}
+
 cmd_start() {
+    ensure_picker
     if systemctl --user is-active --quiet "$UNIT"; then
         echo "daemon already running"
     else
-        systemd-run --user --unit="$UNIT" \
-            --setenv="DOUBLETAKE_TIMING=$DOUBLETAKE_TIMING" \
+        # DOUBLETAKE_MONITOR pins the X11 capture monitor (Go-engine contract);
+        # Wayland ignores it — its selection is xdph's picker. The daemon env
+        # is fixed at spawn, so pass it only when set.
+        local -a envs=(--setenv="DOUBLETAKE_TIMING=$DOUBLETAKE_TIMING")
+        if [ -n "$SAMCAST_MONITOR" ]; then
+            envs+=(--setenv="DOUBLETAKE_MONITOR=$SAMCAST_MONITOR")
+        fi
+        systemd-run --user --unit="$UNIT" "${envs[@]}" \
             --description="samsung-cast AirPlay mirroring daemon" \
             "$DOUBLETAKE" -daemonize -port-range "$SAMCAST_PORT_RANGE" \
             -fps "$SAMCAST_FPS" -hwaccel "$SAMCAST_HWACCEL" $SAMCAST_EXTRA_FLAGS
@@ -129,10 +249,80 @@ cmd_stop()   {
 cmd_status() { "$CTL" status 2>/dev/null || die "daemon not running (samcast start)"; }
 cmd_devices(){ "$CTL" devices 2>/dev/null || die "daemon not running (samcast start)"; }
 
+cmd_monitors() {
+    local names name i=0 suffix
+    names="$(list_monitors)"
+    [ -n "$names" ] || die "no monitors found (Wayland needs hyprctl + a Hyprland session; X11 needs xrandr + DISPLAY)"
+    echo "Monitors:"
+    while IFS= read -r name; do
+        i=$((i + 1))
+        suffix=""
+        if [ "$name" = "$SAMCAST_MONITOR" ]; then suffix=" (configured)"; fi
+        printf '  [%d] %s%s\n' "$i" "$name" "$suffix"
+    done <<<"$names"
+}
+
+# samcast monitor — show or persist which monitor to cast (SAMCAST_MONITOR).
+cmd_monitor() {
+    local name="${1:-}"
+    if [ -z "$name" ]; then
+        if [ -n "$SAMCAST_MONITOR" ]; then
+            echo "$SAMCAST_MONITOR"
+        else
+            echo "auto (choose in the portal dialog)"
+        fi
+        echo "set with: samcast monitor <NAME> (samcast monitors lists them; samcast monitor auto reverts)"
+        return
+    fi
+    if [ "$name" = "auto" ]; then
+        set_config_var SAMCAST_MONITOR ""
+        SAMCAST_MONITOR=""
+        echo "monitor selection: auto — the share-picker dialog shows on each cast"
+        return
+    fi
+    # Output names (eDP-1, DP-1, HDMI-A-1...) are [A-Za-z0-9_-]; anything else
+    # would corrupt the sourced config line or the xdph [SELECTION] answer.
+    case "$name" in
+        *[!A-Za-z0-9_-]*) die "invalid monitor name '$name' (letters, digits, '-' and '_' only, e.g. eDP-1)" ;;
+    esac
+    # Not currently connected is not fatal — allow setting anyway (the monitor
+    # may be undocked now but docked again before the next cast; xdph's picker
+    # falls back to the GUI until then).
+    if ! list_monitors | grep -Fxq "$name"; then
+        echo "samsung-cast: note: '$name' is not connected right now — set anyway (it may be docked again before the next cast)" >&2
+    fi
+    set_config_var SAMCAST_MONITOR "$name"
+    SAMCAST_MONITOR="$name"
+    echo "will cast monitor '$name' ('samcast monitor auto' reverts; 'samcast monitors' lists)"
+}
+
 cmd_on() {
     local pin="${1:-}"
     resolve_target
-    systemctl --user is-active --quiet "$UNIT" || cmd_start >/dev/null
+    ensure_picker  # Wayland: keep xdph pointed at samcast-picker (idempotent)
+    # Picking once here (first interactive cast with >1 monitor, nothing
+    # configured) makes every later cast dialog-free: xdph re-runs its picker
+    # per request and the stored choice short-circuits it.
+    select_monitor
+
+    if systemctl --user is-active --quiet "$UNIT"; then
+        # The daemon's env is fixed at spawn. If its recorded DOUBLETAKE_MONITOR
+        # (the X11 capture monitor — Wayland ignores it) drifted from the
+        # current choice, restart so the change takes effect. Desired value is
+        # absent when SAMCAST_MONITOR is empty (auto).
+        local want="${SAMCAST_MONITOR:-}" have=""
+        have="$(systemctl --user show "$UNIT" -p Environment 2>/dev/null |
+            sed -n 's/^Environment=//p' | tr ' ' '\n' |
+            sed -n 's/^DOUBLETAKE_MONITOR=//p' || true)"
+        if [ "$have" != "$want" ]; then
+            echo "samsung-cast: capture monitor changed (${have:-auto} -> ${want:-auto}) — restarting the daemon"
+            "$CTL" disconnect 2>/dev/null || true
+            systemctl --user stop "$UNIT" 2>/dev/null || true
+            cmd_start
+        fi
+    else
+        cmd_start >/dev/null
+    fi
     # The daemon resolves the AirPlay port from its own mDNS cache; wait until
     # the TV shows up there (a freshly started daemon needs a few seconds).
     local _
@@ -165,6 +355,8 @@ case "$cmd" in
     stop)     cmd_stop ;;
     status)   cmd_status ;;
     devices)  cmd_devices ;;
+    monitors) cmd_monitors ;;
+    monitor)  cmd_monitor "$@" ;;
     on)       cmd_on "$@" ;;
     mirror)   cmd_on "$@" ;;
     off)      cmd_off ;;

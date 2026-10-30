@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# samcast-picker: headless monitor selector for xdg-desktop-portal-hyprland.
+#
+# WHY: xdph implements no portal restore_tokens (it speaks a proprietary
+# `restore_data` dialect), so the stock GUI share-picker would pop on EVERY
+# cast. xdph (>= 1.4.1) instead runs the binary configured as
+# `screencopy:custom_picker_binary` (in ~/.config/hypr/xdph.conf, managed by
+# `samcast`'s ensure_picker) and reads a selection from its stdout: any line
+# containing "[SELECTION]" is parsed as "<flags>/<selection>" — for a whole
+# monitor that is "[SELECTION]/screen:<monitor-name>", WITH a trailing newline
+# (xdph pop_back()s the last character of the name). See xdph's
+# src/shared/ScreencopyShared.cpp. Names are Hyprland output names (eDP-1,
+# DP-1, ...) resolved and enforced by xdph itself.
+#
+# xdph spawns this picker fresh on every screencast request, so it always
+# re-reads the samsung-cast config — a changed SAMCAST_MONITOR applies from
+# the next cast with no portal restart.
+#
+# Copyright (C) 2026 samsung-cast contributors. All rights reserved.
+# Closed source — see README.
+set -euo pipefail
+
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/samsung-cast/config"
+
+# The picker can run with an arbitrary cwd (xdph spawns it), so everything
+# here uses absolute paths; a missing config simply leaves SAMCAST_MONITOR
+# empty (the GUI picker handles the choice).
+if [ -f "$CONF" ]; then
+    # A config that fails to source must not kill the picker (xdph would then
+    # get no [SELECTION] at all and the cast fails) — degrade to the GUI one.
+    # shellcheck source=/dev/null
+    source "$CONF" ||
+        echo "samsung-cast: warning: errors sourcing $CONF — asking via the GUI picker" >&2
+fi
+m="${SAMCAST_MONITOR:-}"
+
+# Nothing configured: today's interactive behavior — hand the request to the
+# stock GUI picker (args like --allow-token are forwarded).
+if [ -z "$m" ]; then
+    exec hyprland-share-picker "$@"
+fi
+
+# The configured monitor must be currently connected; a hyprctl failure (no
+# Hyprland session — e.g. the X11 fallback path) counts as not connected.
+# Either way delegate so casting still works.
+if hyprctl monitors 2>/dev/null | awk -v m="$m" '
+        $1 == "Monitor" && $2 == m { found = 1; exit }
+        END { exit found ? 0 : 1 }'; then
+    printf '[SELECTION]/screen:%s\n' "$m"
+    exit 0
+fi
+echo "samsung-cast: monitor '$m' is not connected right now — falling back to the GUI share picker" >&2
+exec hyprland-share-picker "$@"

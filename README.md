@@ -20,10 +20,11 @@ lifecycle, config, toggle keybind.
 
 ```
 samcast              CLI: discover / pair / start / on / mirror / off / toggle / status / log
+samcast-picker       headless monitor picker run by xdg-desktop-portal-hyprland per cast (Wayland)
 Makefile             builds the fork from ../doubletake-samsung (override: make VENDOR=...), symlinks bin/
 bin/                 build output symlinks (not tracked)
 docs/                protocol findings for this TV
-~/.config/samsung-cast/config   name/FPS/encoder/port-range (written on first run)
+~/.config/samsung-cast/config   name/FPS/encoder/port-range/monitor (written on first run)
 ```
 
 ## Setup (once)
@@ -55,8 +56,40 @@ the laptop or you change its settings.
 ./samcast stop      # stop the daemon entirely
 ```
 
-First run pops the Hyprland screen-share picker once — mirror remembers your panel (portal
-restore token); after that, streams start silently.
+Each cast pops the Hyprland screen-share picker until you pin a monitor (`samcast monitor eDP-1`)
+— xdg-desktop-portal-hyprland implements no portal restore tokens, so the dialog would return on
+every cast. See [Monitor selection](#monitor-selection).
+
+## Monitor selection
+
+Wayland/Hyprland is the primary target: on every cast, xdg-desktop-portal-hyprland (xdph) runs a
+share-picker because it implements no portal `restore_token`s. samcast replaces that dialog with a
+headless picker and a persisted choice:
+
+```sh
+./samcast monitors        # list connectable monitors; the configured one is marked
+./samcast monitor eDP-1   # pin the capture monitor — casts start silently from now on
+./samcast monitor         # show the current selection
+./samcast monitor auto    # back to the GUI share-picker dialog on every cast
+```
+
+With more than one monitor connected and none configured, the first interactive `samcast on` asks
+in the terminal and persists the pick (a keybound `samcast toggle` never prompts; undocked
+monitors can still be pinned — the picker falls back to the GUI while they are absent).
+
+Mechanics: on the first `samcast start`/`on` (Wayland sessions only), samcast writes
+`screencopy:custom_picker_binary = <repo>/samcast-picker` into `~/.config/hypr/xdph.conf` —
+creating the file if needed and restarting `xdg-desktop-portal-hyprland.service` only when the
+file changed; a key already pointing elsewhere is left alone with a warning. The picker (xdph
+spawns it fresh per cast, so config changes apply immediately) reads `SAMCAST_MONITOR` from
+`~/.config/samsung-cast/config`, answers xdph's `[SELECTION]` protocol with `screen:<monitor>`
+(names are Hyprland output names, enforced by xdph; see xdph's `src/shared/ScreencopyShared.cpp`),
+and delegates to `/usr/bin/hyprland-share-picker` when nothing valid is configured.
+
+On X11 (fallback path in the Go engine) the monitor is chosen by the `DOUBLETAKE_MONITOR` env
+var, which `samcast` passes to the daemon at spawn (`SAMCAST_MONITOR` also feeds it). Because a
+daemon's env is fixed at spawn, changing the monitor on X11 needs a daemon restart — `samcast on`
+detects the drift and restarts automatically. Wayland selection ignores that variable entirely.
 
 ## Tuning
 
@@ -70,6 +103,7 @@ restore token); after that, streams start silently.
 | `SAMCAST_PORT_RANGE` | `60000-60010` | UDP for timing/audio/control |
 | `SAMCAST_TIMING` | `NTP` | `NTP`/`PTP`; CU7000 needs NTP (see patches note below) |
 | `SAMCAST_EXTRA_FLAGS` | — | passed through, e.g. `"-bitrate 4500 -no-audio"` |
+| `SAMCAST_MONITOR` | `""` | capture monitor (e.g. `eDP-1`); empty = picker dialog per cast — see Monitor selection |
 
 ## Status (verified on this machine, 2026-10-29)
 
