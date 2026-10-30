@@ -19,7 +19,7 @@ lifecycle, config, toggle keybind.
 ## Layout
 
 ```
-samcast              CLI: discover / pair / start / on / mirror / off / toggle / status / log
+samcast              CLI: discover / tvs / tv / pair / start / on / mirror / off / toggle / status / log
 samcast-picker       headless monitor picker run by xdg-desktop-portal-hyprland per cast (Wayland)
 Makefile             builds the fork from ../doubletake-samsung (override: make VENDOR=...), symlinks bin/
 bin/                 build output symlinks (not tracked)
@@ -91,13 +91,37 @@ var, which `samcast` passes to the daemon at spawn (`SAMCAST_MONITOR` also feeds
 daemon's env is fixed at spawn, changing the monitor on X11 needs a daemon restart — `samcast on`
 detects the drift and restarts automatically. Wayland selection ignores that variable entirely.
 
+## TV selection
+
+A TV's identity is its mDNS service name — `SAMCAST_NAME` in the config (default `Sam58`);
+switching TVs means switching that name, and a name is always required (there is no auto):
+
+```sh
+./samcast tvs            # list Samsung TVs seen on the LAN; the configured one is marked
+./samcast tv "Den TV"    # set the TV by mDNS name (spaces are fine)
+./samcast tv             # show the current selection
+```
+
+Names are free-form (they come straight from the TV's advertisement), but `|`, `"`, `\`, `&` and
+newlines are rejected — they would corrupt the sourced config or the sed rewrite that persists
+them. Setting a name that is currently unreachable still works (standby drops the TV's Wi-Fi):
+samcast warns and pins it for later. A TV only ever needs `./samcast pair` once — pairing
+credentials are per-TV — before `samcast on` can mirror to it.
+
+When the configured TV is unreachable while other Samsung receivers are in sight, a run in a
+terminal (`samcast on`/`toggle`/`pair`/`target`) prints the TVs it sees, numbered, and offers to
+switch: a valid pick is persisted and the cast proceeds against it. The prompt deliberately has
+no default — empty or invalid input falls back to the usual "'…' not found on the network"
+failure, and non-interactive runs (a keybound `toggle`, scripts) never prompt at all, so nothing
+ever starts casting to another room's TV by surprise.
+
 ## Tuning
 
 `~/.config/samsung-cast/config` (sourced by `samcast`):
 
 | Var | Default | Notes |
 |---|---|---|
-| `SAMCAST_NAME` | `Sam58` | mDNS service name; TV must be on (standby drops its Wi-Fi) |
+| `SAMCAST_NAME` | `Sam58` | mDNS service name — the TV identity; set with `samcast tv` (`samcast tvs` lists). TV must be on (standby drops its Wi-Fi) |
 | `SAMCAST_FPS` | `60` | set `30` on weak Wi-Fi |
 | `SAMCAST_HWACCEL` | `auto` | `vaapi` (AMD iGPU) / `nvenc` (GTX 1650) / `openh264` / `none` |
 | `SAMCAST_PORT_RANGE` | `60000-60010` | UDP for timing/audio/control |

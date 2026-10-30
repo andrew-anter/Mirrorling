@@ -24,7 +24,7 @@ if [ ! -f "$CONF" ]; then
     mkdir -p "$CONF_DIR"
     cat > "$CONF" <<'EOF'
 # samsung-cast configuration (sourced by samcast)
-SAMCAST_NAME="Sam58"            # mDNS service name of the TV (see: samcast discover)
+SAMCAST_NAME="Sam58"            # mDNS service name of the TV (see: samcast tvs / samcast tv)
 SAMCAST_FPS=60                  # capture frame rate (30 saves Wi-Fi bandwidth)
 SAMCAST_HWACCEL=auto            # auto | vaapi | nvenc | openh264 | none
 SAMCAST_PORT_RANGE="60000-60010"
@@ -62,6 +62,8 @@ samsung-cast — mirror this desktop to "$SAMCAST_NAME" (Samsung AirPlay 2)
   samcast monitors        list connectable monitors (Hyprland outputs / X11 screens)
   samcast monitor [NAME|auto]
                           show or set the monitor to cast (auto = picker dialog per cast)
+  samcast tvs             list Samsung TVs seen on the LAN (the configured one is marked)
+  samcast tv [NAME]       show or set the TV to cast (a name is always required; no auto)
   samcast log [-f]        daemon logs (journalctl)
 
 Env overrides after config: SAMCAST_NAME, SAMCAST_FPS, SAMCAST_HWACCEL,
@@ -73,8 +75,8 @@ die() { echo "samsung-cast: $*" >&2; exit 1; }
 
 # Persist KEY="VALUE" in $CONF: sed-replace the existing line, append when the
 # key is missing (configs written before a feature predate its variable).
-# Callers validate VALUE (monitor names are ^[A-Za-z0-9_-]+$ or empty), so no
-# sed metacharacters can sneak in.
+# Callers validate VALUE (monitor names are ^[A-Za-z0-9_-]+$ or empty, TV
+# names via tv_name_ok), so no sed metacharacters can sneak in.
 set_config_var() {
     local key="$1" value="$2"
     if grep -q "^${key}=" "$CONF"; then
@@ -82,6 +84,19 @@ set_config_var() {
     else
         printf '%s="%s"\n' "$key" "$value" >> "$CONF"
     fi
+}
+
+# TV names are free-form mDNS service names (spaces are legitimate — the $4
+# parse already truncates at the first space, a pre-existing limitation), but
+# they land inside a sed replacement and a quoted line of sourced shell: '|'
+# breaks the sed delimiter, '"' breaks the quoting, '\' and '&' are sed
+# replacement metacharacters, a newline would inject a config line. Exactly
+# that set is refused — nothing more.
+tv_name_ok() {
+    case "$1" in
+        *'|'*|*'"'*|*'\'*|*'&'*|*$'\n'*) return 1 ;;
+    esac
+    return 0
 }
 
 # Capture-capable monitor names, one per line, on stdout. Wayland/Hyprland is
@@ -97,15 +112,99 @@ list_monitors() {
     fi
 }
 
-# Resolve the TV's IP + AirPlay port from mDNS (avahi). TV must be powered on.
-# Sets TARGET_IP and TARGET_PORT (Samsung picks a dynamic AirPlay port, e.g. 51820, not 7000).
-resolve_target() {
-    local out
-    out="$(avahi-browse -rt _airplay._tcp -t 2>/dev/null | awk -v n="$SAMCAST_NAME" '
-        $1 == "=" && $4 == n { grab = 1; next }
+# One parse of the same avahi-browse invocation resolve_target matches with:
+# one line per receiver with a TXT model, as name<TAB>ip<TAB>model<TAB>fw (fw
+# may be empty when the TV omits fv=). Same $4 convention as everywhere else —
+# service names with spaces truncate at their first word (pre-existing
+# limitation, kept). Listing order is avahi's (unordered), as discover always
+# printed.
+scan_tvs() {
+    avahi-browse -rt _airplay._tcp -t 2>/dev/null | awk '
+        $1 == "=" { name = $4; next }
+        name == "" { next }
+        /address =/ { gsub(/[][]/, ""); sub(/^.*address = /, ""); addr[name] = $0; next }
+        match($0, /model=[^"]+/) { model[name] = substr($0, RSTART + 6, RLENGTH - 6) }
+        match($0, /fv=[^"]+/)    { fw[name]    = substr($0, RSTART + 3, RLENGTH - 3) }
+        END {
+            for (n in addr)
+                if (model[n] ~ /^U/)   # Samsung consumer models start with U (UAU7000, UE*, UN*, ...)
+                    printf "%s\t%s\t%s\t%s\n", n, addr[n], model[n], fw[n]
+        }' || true
+}
+
+# What the TV-selection code matches on: name<TAB>ip<TAB>model per Samsung
+# receiver (the /^U/ filter in scan_tvs already drops non-Samsung and
+# empty-model services). fw is display-only, so it is dropped here.
+list_tvs() {
+    scan_tvs | cut -f1-3
+}
+
+# Terminal rescue when the configured TV is missing but other Samsung
+# receivers are in sight: list them numbered and persist an explicit pick.
+# No default: an empty/invalid answer must NOT cast to whichever other room's
+# TV happens to be up — it returns 1 so the caller dies with its usual
+# message. Everything goes to stderr: resolve_target's callers (cmd_target)
+# print values on stdout. Caller checks the TTY — keybindings never see this.
+select_tv() {
+    local rows name ip model count=0 pick chosen
+    local -a opts=()
+    rows="$(list_tvs)"
+    [ -n "$rows" ] || return 1
+    echo "'$SAMCAST_NAME' not found on the network — other Samsung receivers in sight:" >&2
+    while IFS=$'\t' read -r name ip model; do
+        [ -n "$name" ] || continue
+        opts+=("$name"$'\t'"$ip"$'\t'"$model")
+        count=$((count + 1))
+        printf '  [%d] %s  %s  model=%s\n' "$count" "$name" "$ip" "$model" >&2
+    done <<<"$rows"
+    [ "$count" -gt 0 ] || return 1
+    if ! read -r -p "Cast to: " pick; then
+        return 1  # stdin closed mid-prompt — keep the configured TV
+    fi
+    if [ "$pick" -eq "$pick" ] 2>/dev/null && [ "$pick" -ge 1 ] && [ "$pick" -le "$count" ]; then
+        chosen="${opts[$((pick - 1))]}"
+    else
+        echo "samsung-cast: '$pick' is not a menu option" >&2
+        return 1
+    fi
+    IFS=$'\t' read -r name ip model <<<"$chosen"
+    tv_name_ok "$name" || return 1  # hostile mDNS name — refuse, caller dies below
+    set_config_var SAMCAST_NAME "$name"
+    SAMCAST_NAME="$name"
+    echo "will cast '$name' — run 'samcast pair' before the first cast to this TV" >&2
+}
+
+# The resolve_target matcher, factored so the post-pick re-resolve can reuse
+# it: prints "ip port" when NAME is advertising on AirPlay, nothing otherwise.
+# || true so a missing avahi-browse degrades to "not found" (clear die) rather
+# than a set -e pipeline error.
+# Every service block starts with a "=" header line, so the header re-matches
+# grab each time: a partial record for NAME (address but no port) must resolve
+# to nothing — NOT bleed into the next service's lines and "resolve" NAME to
+# another TV's ip:port.
+match_target() {
+    local name="$1"
+    avahi-browse -rt _airplay._tcp -t 2>/dev/null | awk -v n="$name" '
+        $1 == "=" { grab = ($4 == n); next }
         grab && /address =/ { gsub(/[][]/, ""); sub(/^.*address = /, ""); ip = $0 }
         grab && /port =/    { gsub(/[][]/, ""); sub(/^.*port = /, "");    port = $0 }
-        grab && ip != "" && port != "" { print ip, port; exit }')"
+        grab && ip != "" && port != "" { print ip, port; exit }' || true
+}
+
+# Resolve the TV's IP + AirPlay port from mDNS (avahi). TV must be powered on.
+# Sets TARGET_IP and TARGET_PORT (Samsung picks a dynamic AirPlay port, e.g. 51820, not 7000).
+#
+# Rescue prompt fires ONLY when the configured TV is missing — never while it
+# resolves (switching between two live TVs is `samcast tv`'s job) — and only
+# on a TTY; keybindings/scripts keep the plain die. A picked name is
+# re-resolved exactly once below: if it fails too, control falls to the die
+# (with the new name) instead of looping.
+resolve_target() {
+    local out
+    out="$(match_target "$SAMCAST_NAME")"
+    if [ -z "$out" ] && [ -t 0 ] && select_tv; then
+        out="$(match_target "$SAMCAST_NAME")"
+    fi
     [ -n "$out" ] || die "'$SAMCAST_NAME' not found on the network (is the TV on and on Wi-Fi?)"
     TARGET_IP="${out% *}"; TARGET_PORT="${out#* }"
 }
@@ -116,18 +215,15 @@ stream_flags() {
 }
 
 cmd_discover() {
+    local rows name ip model fw
     echo "Samsung AirPlay receivers on this network:"
-    avahi-browse -rt _airplay._tcp -t 2>/dev/null | awk '
-        $1 == "=" { name = $4; next }
-        name == "" { next }
-        /address =/ { gsub(/[][]/, ""); sub(/^.*address = /, ""); addr[name] = $0; next }
-        match($0, /model=[^"]+/) { model[name] = substr($0, RSTART + 6, RLENGTH - 6) }
-        match($0, /fv=[^"]+/)    { fw[name]    = substr($0, RSTART + 3, RLENGTH - 3) }
-        END {
-            for (n in addr)
-                if (model[n] ~ /^U/)   # Samsung consumer models start with U (UAU7000, UE*, UN*, ...)
-                    printf "  %-10s %-15s model=%-10s fw=%s\n", n, addr[n], model[n], fw[n]
-        }'
+    rows="$(scan_tvs)"
+    while IFS=$'\t' read -r name ip model fw; do
+        [ -n "$name" ] || continue  # empty scan -> one empty herestring line
+        # scan_tvs applied the /^U/ Samsung filter; this keeps discover's
+        # historical columns (fw prints empty when the TV omits fv=).
+        printf '  %-10s %-15s model=%-10s fw=%s\n' "$name" "$ip" "$model" "$fw"
+    done <<<"$rows"
 }
 
 cmd_target() { resolve_target; echo "$TARGET_IP:$TARGET_PORT"; }
@@ -296,6 +392,48 @@ cmd_monitor() {
     echo "will cast monitor '$name' ('samcast monitor auto' reverts; 'samcast monitors' lists)"
 }
 
+# samcast tvs — the LAN, numbered like cmd_monitors, configured TV marked.
+cmd_tvs() {
+    local rows name ip model i=0 suffix
+    rows="$(list_tvs)"
+    [ -n "$rows" ] || die "no Samsung TVs discovered (is a TV powered on? standby drops its Wi-Fi)"
+    echo "TVs:"
+    while IFS=$'\t' read -r name ip model; do
+        [ -n "$name" ] || continue
+        i=$((i + 1))
+        suffix=""
+        if [ "$name" = "$SAMCAST_NAME" ]; then suffix=" (configured)"; fi
+        printf '  [%d] %s  %s  model=%s%s\n' "$i" "$name" "$ip" "$model" "$suffix"
+    done <<<"$rows"
+    echo "set with: samcast tv <NAME>"
+}
+
+# samcast tv — show or persist which TV to cast (SAMCAST_NAME). The mDNS
+# service name IS the TV identity the config carries; unlike monitors there is
+# no auto — a name is always required (no per-cast picker exists for TVs).
+cmd_tv() {
+    local name="${1:-}"
+    if [ -z "$name" ]; then
+        if [ -n "$SAMCAST_NAME" ]; then
+            echo "$SAMCAST_NAME"
+        else
+            echo "(none)"
+        fi
+        echo "set with: samcast tv <NAME> (samcast tvs lists them)"
+        return
+    fi
+    tv_name_ok "$name" ||
+        die "invalid TV name '$name' ('|', '\"', '\\', '&' and newlines would corrupt the config; spaces are fine)"
+    # Not on the network right now is not fatal — standby drops the TV's
+    # Wi-Fi; allow setting anyway (it may be powered on before the next cast).
+    if ! list_tvs | cut -f1 | grep -Fxq -e "$name"; then
+        echo "samsung-cast: note: '$name' is not on the network right now — set anyway (run 'samcast tvs' once it is powered on)" >&2
+    fi
+    set_config_var SAMCAST_NAME "$name"
+    SAMCAST_NAME="$name"
+    echo "will cast '$name' ('samcast pair' is needed the first time this TV is used; 'samcast tvs' lists)"
+}
+
 cmd_on() {
     local pin="${1:-}"
     resolve_target
@@ -357,6 +495,8 @@ case "$cmd" in
     devices)  cmd_devices ;;
     monitors) cmd_monitors ;;
     monitor)  cmd_monitor "$@" ;;
+    tvs)      cmd_tvs ;;
+    tv)       cmd_tv "$@" ;;
     on)       cmd_on "$@" ;;
     mirror)   cmd_on "$@" ;;
     off)      cmd_off ;;
