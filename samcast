@@ -121,30 +121,62 @@ list_monitors() {
 }
 
 # One parse of the same avahi-browse invocation resolve_target matches with:
-# one line per receiver with a TXT model, as name<TAB>ip<TAB>model<TAB>fw (fw
-# may be empty when the TV omits fv=). Same $4 convention as everywhere else —
-# service names with spaces truncate at their first word (pre-existing
-# limitation, kept). Listing order is avahi's (unordered), as discover always
-# printed.
+# one line per receiver as name<TAB>ip<TAB>port<TAB>model<TAB>fw (fw may be
+# empty when the TV omits fv=; port feeds tv_alive's reachability probe). Same
+# $4 convention as everywhere else — service names with spaces truncate at
+# their first word (pre-existing limitation, kept). Listing order is avahi's
+# (unordered), as discover always printed.
 scan_tvs() {
     avahi-browse -rt _airplay._tcp -t 2>/dev/null | awk '
         $1 == "=" { name = $4; next }
         name == "" { next }
         /address =/ { gsub(/[][]/, ""); sub(/^.*address = /, ""); addr[name] = $0; next }
+        /port =/    { gsub(/[][]/, ""); sub(/^.*port = /, "");    port[name] = $0; next }
         match($0, /model=[^"]+/) { model[name] = substr($0, RSTART + 6, RLENGTH - 6) }
         match($0, /fv=[^"]+/)    { fw[name]    = substr($0, RSTART + 3, RLENGTH - 3) }
         END {
             for (n in addr)
                 if (model[n] ~ /^U/)   # Samsung consumer models start with U (UAU7000, UE*, UN*, ...)
-                    printf "%s\t%s\t%s\t%s\n", n, addr[n], model[n], fw[n]
+                    printf "%s\t%s\t%s\t%s\t%s\n", n, addr[n], port[n], model[n], fw[n]
         }' || true
 }
 
 # What the TV-selection code matches on: name<TAB>ip<TAB>model per Samsung
 # receiver (the /^U/ filter in scan_tvs already drops non-Samsung and
-# empty-model services). fw is display-only, so it is dropped here.
+# empty-model services). port is resolve-only, fw is display-only — both
+# dropped here.
 list_tvs() {
-    scan_tvs | cut -f1-3
+    scan_tvs | cut -f1,2,4
+}
+
+# A stale avahi record outlives the TV: standby drops its Wi-Fi but avahi
+# keeps the cached service until the record's TTL lapses, so "advertised" is
+# no proof the TV is there. Live therefore means advertised AND connectable:
+# a sub-second TCP connect to the advertised AirPlay port (Samsung picks it
+# dynamically, so it must come from the record). 1s absorbs unroutable
+# addresses; a real TV on the LAN answers in LAN latency, so the common path
+# costs almost nothing.
+tv_alive() {
+    local ip="$1" port="$2"
+    [ -n "$ip" ] && [ -n "$port" ] || return 1
+    timeout 1 bash -c 'exec 3<>/dev/tcp/$1/$2' _ "$ip" "$port" 2>/dev/null
+}
+
+# list_tvs kept only to TVs that actually answer: the rescue prompt must not
+# offer a dead TV, and `tvs` must not report a powered-off one as live (a
+# stale record then just falls through to the saved list). Sequential on
+# purpose — typically one or two TVs, and alive ones answer immediately.
+# return 0 because the loop's status is its last body command: a dead TV at
+# EOF would otherwise fail the function (set -e) for callers.
+list_tvs_alive() {
+    local name ip port model
+    while IFS=$'\t' read -r name ip port model; do
+        [ -n "$name" ] || continue
+        if tv_alive "$ip" "$port"; then
+            printf '%s\n' "$name"$'\t'"$ip"$'\t'"$model"
+        fi
+    done < <(scan_tvs)
+    return 0
 }
 
 # Saved TVs: every name the user ever picked, so `tvs` can keep it listed
@@ -185,7 +217,7 @@ forget_known_tv() {
 select_tv() {
     local rows name ip model count=0 pick chosen
     local -a opts=()
-    rows="$(list_tvs)"
+    rows="$(list_tvs_alive)"
     [ -n "$rows" ] || return 1
     echo "'$SAMCAST_NAME' not found on the network — other Samsung receivers in sight:" >&2
     while IFS=$'\t' read -r name ip model; do
@@ -221,12 +253,19 @@ select_tv() {
 # to nothing — NOT bleed into the next service's lines and "resolve" NAME to
 # another TV's ip:port.
 match_target() {
-    local name="$1"
-    avahi-browse -rt _airplay._tcp -t 2>/dev/null | awk -v n="$name" '
+    local name="$1" out
+    out="$(avahi-browse -rt _airplay._tcp -t 2>/dev/null | awk -v n="$name" '
         $1 == "=" { grab = ($4 == n); next }
         grab && /address =/ { gsub(/[][]/, ""); sub(/^.*address = /, ""); ip = $0 }
         grab && /port =/    { gsub(/[][]/, ""); sub(/^.*port = /, "");    port = $0 }
-        grab && ip != "" && port != "" { print ip, port; exit }' || true
+        grab && ip != "" && port != "" { print ip, port; exit }')" || true
+    [ -n "$out" ] || return 0
+    # The record can outlive the TV (stale cache). A dead endpoint must read
+    # as "not found" so the caller prompts or dies with the friendly message
+    # instead of hanging while the stream dials a ghost.
+    if tv_alive "${out% *}" "${out#* }"; then
+        printf '%s\n' "$out"
+    fi
 }
 
 # Resolve the TV's IP + AirPlay port from mDNS (avahi). TV must be powered on.
@@ -253,13 +292,15 @@ stream_flags() {
 }
 
 cmd_discover() {
-    local rows name ip model fw
+    local rows name ip port model fw
     echo "Samsung AirPlay receivers on this network:"
     rows="$(scan_tvs)"
-    while IFS=$'\t' read -r name ip model fw; do
+    while IFS=$'\t' read -r name ip port model fw; do
         [ -n "$name" ] || continue  # empty scan -> one empty herestring line
         # scan_tvs applied the /^U/ Samsung filter; this keeps discover's
-        # historical columns (fw prints empty when the TV omits fv=).
+        # historical columns (fw prints empty when the TV omits fv=). Raw
+        # mDNS view: no liveness probing here, `samcast tvs` is the
+        # can-I-cast view.
         printf '  %-10s %-15s model=%-10s fw=%s\n' "$name" "$ip" "$model" "$fw"
     done <<<"$rows"
 }
@@ -458,7 +499,7 @@ cmd_tvs() {
     if [ "${1:-}" = "--raw" ]; then raw=1; shift; fi
     [ $# -eq 0 ] || die "unknown argument: $1"
     local rows known combined="" live="" name ip model state i=0 suffix
-    rows="$(list_tvs)"
+    rows="$(list_tvs_alive)"  # a stale advertised record reports as saved, not live
     known="$(known_tvs)"
     [ -n "$rows" ] || [ -n "$known" ] || [ -n "${SAMCAST_NAME:-}" ] ||
         die "no Samsung TVs discovered (is a TV powered on? standby drops its Wi-Fi)"
@@ -543,7 +584,7 @@ cmd_tv() {
         die "invalid TV name '$name' ('|', '\"', '\\', '&' and newlines would corrupt the config; spaces are fine)"
     # Not on the network right now is not fatal — standby drops the TV's
     # Wi-Fi; allow setting anyway (it may be powered on before the next cast).
-    if ! list_tvs | cut -f1 | grep -Fxq -e "$name"; then
+    if ! list_tvs_alive | cut -f1 | grep -Fxq -e "$name"; then
         echo "samsung-cast: note: '$name' is not on the network right now — set anyway (run 'samcast tvs' once it is powered on)" >&2
     fi
     set_config_var SAMCAST_NAME "$name"
