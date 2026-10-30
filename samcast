@@ -3,6 +3,7 @@
 # 58CU7000 (Tizen AirPlay 2) via the doubletake-samsung fork.
 #
 # Config: ~/.config/samsung-cast/config (sourced shell, written on first run)
+# Saved TVs: ~/.config/samsung-cast/tvs (one name per line, MRU first)
 # Logs:   journalctl --user -u samsung-cast
 #
 # Copyright (C) 2026 samsung-cast contributors. All rights reserved.
@@ -13,8 +14,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DOUBLETAKE="$SCRIPT_DIR/bin/doubletake"
 CTL="$SCRIPT_DIR/bin/doubletake-ctl"
+UI_BIN="$SCRIPT_DIR/bin/samcast-ui"
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/samsung-cast"
 CONF="$CONF_DIR/config"
+KNOWN_TVS="$CONF_DIR/tvs"  # TVs the user picked at least once (see known_tvs)
 RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 SOCK="$RUNTIME_DIR/doubletake.sock"
 UNIT="samsung-cast"
@@ -62,9 +65,14 @@ samsung-cast — mirror this desktop to "$SAMCAST_NAME" (Samsung AirPlay 2)
   samcast monitors        list connectable monitors (Hyprland outputs / X11 screens)
   samcast monitor [NAME|auto]
                           show or set the monitor to cast (auto = picker dialog per cast)
-  samcast tvs             list Samsung TVs seen on the LAN (the configured one is marked)
-  samcast tv [NAME]       show or set the TV to cast (a name is always required; no auto)
+  samcast tvs             list Samsung TVs seen on the LAN or saved earlier (the configured one is marked)
+  samcast tv [NAME|--forget NAME]
+                          show, set, or forget the TV to cast (a name is always required; no auto)
   samcast log [-f]        daemon logs (journalctl)
+  samcast ui [--port N] [--no-open|--browser]
+                          serve the control panel and open its window
+
+--raw after tvs/tv/monitors/monitor prints machine-readable output, for the UI.
 
 Env overrides after config: SAMCAST_NAME, SAMCAST_FPS, SAMCAST_HWACCEL,
 SAMCAST_PORT_RANGE, SAMCAST_EXTRA_FLAGS, SAMCAST_MONITOR.
@@ -139,6 +147,35 @@ list_tvs() {
     scan_tvs | cut -f1-3
 }
 
+# Saved TVs: every name the user ever picked, so `tvs` can keep it listed
+# (greyed, offline) after standby drops the TV from the network. One name per
+# line, most-recently-used first; tv_name_ok refuses newlines, so
+# line-per-name cannot break, and a missing file is just an empty list.
+known_tvs() {
+    cat "$KNOWN_TVS" 2>/dev/null || true
+}
+
+# Prepend NAME, dropping any earlier occurrence (MRU-first). temp+mv in
+# $CONF_DIR keeps an interrupted write from truncating the list.
+save_known_tv() {
+    local name="$1"
+    mkdir -p "$CONF_DIR"
+    {
+        printf '%s\n' "$name"
+        grep -Fxv -e "$name" "$KNOWN_TVS" 2>/dev/null || true
+    } > "$KNOWN_TVS.tmp.$$"
+    mv "$KNOWN_TVS.tmp.$$" "$KNOWN_TVS"
+}
+
+# Drop every exact-line match for NAME; forgetting a name that is not saved
+# is a no-op, not an error.
+forget_known_tv() {
+    local name="$1"
+    [ -f "$KNOWN_TVS" ] || return 0
+    grep -Fxv -e "$name" "$KNOWN_TVS" > "$KNOWN_TVS.tmp.$$" || true
+    mv "$KNOWN_TVS.tmp.$$" "$KNOWN_TVS"
+}
+
 # Terminal rescue when the configured TV is missing but other Samsung
 # receivers are in sight: list them numbered and persist an explicit pick.
 # No default: an empty/invalid answer must NOT cast to whichever other room's
@@ -171,6 +208,7 @@ select_tv() {
     tv_name_ok "$name" || return 1  # hostile mDNS name — refuse, caller dies below
     set_config_var SAMCAST_NAME "$name"
     SAMCAST_NAME="$name"
+    save_known_tv "$name"
     echo "will cast '$name' — run 'samcast pair' before the first cast to this TV" >&2
 }
 
@@ -346,9 +384,17 @@ cmd_status() { "$CTL" status 2>/dev/null || die "daemon not running (samcast sta
 cmd_devices(){ "$CTL" devices 2>/dev/null || die "daemon not running (samcast start)"; }
 
 cmd_monitors() {
+    # --raw (UI contract): names only, one per line — sole argument only.
+    local raw=""
+    if [ "${1:-}" = "--raw" ]; then raw=1; shift; fi
+    [ $# -eq 0 ] || die "unknown argument: $1"
     local names name i=0 suffix
     names="$(list_monitors)"
     [ -n "$names" ] || die "no monitors found (Wayland needs hyprctl + a Hyprland session; X11 needs xrandr + DISPLAY)"
+    if [ -n "$raw" ]; then
+        printf '%s\n' "$names"
+        return
+    fi
     echo "Monitors:"
     while IFS= read -r name; do
         i=$((i + 1))
@@ -360,6 +406,13 @@ cmd_monitors() {
 
 # samcast monitor — show or persist which monitor to cast (SAMCAST_MONITOR).
 cmd_monitor() {
+    # --raw (UI contract): the configured name, or "auto" spelled out — sole argument only.
+    if [ "${1:-}" = "--raw" ]; then
+        shift
+        [ $# -eq 0 ] || die "unknown argument: $1"
+        echo "${SAMCAST_MONITOR:-auto}"
+        return
+    fi
     local name="${1:-}"
     if [ -z "$name" ]; then
         if [ -n "$SAMCAST_MONITOR" ]; then
@@ -392,26 +445,90 @@ cmd_monitor() {
     echo "will cast monitor '$name' ('samcast monitor auto' reverts; 'samcast monitors' lists)"
 }
 
-# samcast tvs — the LAN, numbered like cmd_monitors, configured TV marked.
+# samcast tvs — the LAN, numbered like cmd_monitors, configured TV marked,
+# merged with the saved list: TVs picked earlier stay listed (greyed in the
+# UI) when standby dropped them, so they can be re-pinned or forgotten.
 cmd_tvs() {
-    local rows name ip model i=0 suffix
+    # --raw (UI contract): name<TAB>ip<TAB>model<TAB>state per row — state is
+    # "live" or "saved", and saved rows leave ip/model empty (two tabs). No
+    # header or hint — sole argument only. Dies only when the MERGED list
+    # (live + saved + configured) is entirely empty: a TV-less LAN with a
+    # configured TV still has something to show.
+    local raw=""
+    if [ "${1:-}" = "--raw" ]; then raw=1; shift; fi
+    [ $# -eq 0 ] || die "unknown argument: $1"
+    local rows known combined="" live="" name ip model state i=0 suffix
     rows="$(list_tvs)"
-    [ -n "$rows" ] || die "no Samsung TVs discovered (is a TV powered on? standby drops its Wi-Fi)"
-    echo "TVs:"
+    known="$(known_tvs)"
+    [ -n "$rows" ] || [ -n "$known" ] || [ -n "${SAMCAST_NAME:-}" ] ||
+        die "no Samsung TVs discovered (is a TV powered on? standby drops its Wi-Fi)"
     while IFS=$'\t' read -r name ip model; do
+        [ -n "$name" ] || continue  # empty scan -> one empty herestring line
+        combined+="$name"$'\t'"$ip"$'\t'"$model"$'\t'"live"$'\n'
+        live+="$name"$'\n'
+    done <<<"$rows"
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        if printf '%s' "$live" | grep -Fxq -e "$name"; then continue; fi
+        combined+="$name"$'\t\t\tsaved'$'\n'
+    done <<<"$known"
+    # The configured name backfills when it is neither live nor saved (a
+    # config predating the saved list, say) — it must never go invisible.
+    if [ -n "${SAMCAST_NAME:-}" ] &&
+        ! printf '%s' "$live" | grep -Fxq -e "$SAMCAST_NAME" &&
+        ! printf '%s' "$known" | grep -Fxq -e "$SAMCAST_NAME"; then
+        combined+="$SAMCAST_NAME"$'\t\t\tsaved'$'\n'
+    fi
+    if [ -n "$raw" ]; then
+        printf '%s' "$combined"
+        return
+    fi
+    echo "TVs:"
+    while IFS=$'\t' read -r name ip model state; do
         [ -n "$name" ] || continue
         i=$((i + 1))
         suffix=""
         if [ "$name" = "$SAMCAST_NAME" ]; then suffix=" (configured)"; fi
-        printf '  [%d] %s  %s  model=%s%s\n' "$i" "$name" "$ip" "$model" "$suffix"
-    done <<<"$rows"
+        if [ "$state" = "live" ]; then
+            printf '  [%d] %s  %s  model=%s%s\n' "$i" "$name" "$ip" "$model" "$suffix"
+        else
+            printf '  [%d] %s  saved — not on the network%s\n' "$i" "$name" "$suffix"
+        fi
+    done <<<"$combined"
     echo "set with: samcast tv <NAME>"
 }
 
 # samcast tv — show or persist which TV to cast (SAMCAST_NAME). The mDNS
 # service name IS the TV identity the config carries; unlike monitors there is
 # no auto — a name is always required (no per-cast picker exists for TVs).
+# --forget NAME drops a name from the saved list only; SAMCAST_NAME stands.
 cmd_tv() {
+    # --raw (UI contract): the bare name, exit 0 always (no "(none)" placeholder,
+    # no discovery round-trip) — sole argument only.
+    if [ "${1:-}" = "--raw" ]; then
+        shift
+        [ $# -eq 0 ] || die "unknown argument: $1"
+        echo "$SAMCAST_NAME"
+        return
+    fi
+    # --forget consumes the NEXT argument as the name and only edits the saved
+    # list — the casting config (SAMCAST_NAME) is deliberately left intact.
+    if [ "${1:-}" = "--forget" ]; then
+        shift
+        [ $# -ge 1 ] || die "tv --forget needs a name ('samcast tvs' lists the saved ones)"
+        local forgotten="$1"
+        shift
+        [ $# -eq 0 ] || die "unknown argument: $1"
+        tv_name_ok "$forgotten" ||
+            die "invalid TV name '$forgotten' ('|', '\"', '\\', '&' and newlines would corrupt the config; spaces are fine)"
+        forget_known_tv "$forgotten"
+        if [ "$forgotten" = "$SAMCAST_NAME" ]; then
+            echo "forgot '$forgotten' — it is still the configured TV — set another with: samcast tv <NAME>"
+        else
+            echo "forgot '$forgotten'"
+        fi
+        return
+    fi
     local name="${1:-}"
     if [ -z "$name" ]; then
         if [ -n "$SAMCAST_NAME" ]; then
@@ -431,6 +548,9 @@ cmd_tv() {
     fi
     set_config_var SAMCAST_NAME "$name"
     SAMCAST_NAME="$name"
+    # select_tv's rescue prompt saves too — both sites exist so ANY path that
+    # pins a TV remembers it, and tvs keeps it listed once it goes offline.
+    save_known_tv "$name"
     echo "will cast '$name' ('samcast pair' is needed the first time this TV is used; 'samcast tvs' lists)"
 }
 
@@ -484,6 +604,165 @@ cmd_toggle() {
 
 cmd_log() { journalctl --user -u "$UNIT" "$@"; }
 
+# One GET /api/health against 127.0.0.1:$1 via bash's /dev/tcp (no curl
+# dependency). Prints the peer's first response line (e.g. "HTTP/1.0 200 OK")
+# and returns 0 when something answered; 1 when the connection was refused
+# (nothing listening); 2 when the port accepted but sent nothing for 5s — an
+# open port that is not talking HTTP must NOT look like a free port, or a
+# second server would just crash-bind on it. The read timeout keeps a hung
+# listener from stalling the launch.
+ui_health_status() {
+    local port="$1" line=""
+    # bash prints /dev/tcp failures before a trailing 2>/dev/null applies
+    # (redirections are processed left-to-right), so the silencing is scoped to
+    # this group; the fd 3 it opens persists past the closing brace.
+    { exec 3<>"/dev/tcp/127.0.0.1/$port"; } 2>/dev/null || return 1
+    printf 'GET /api/health HTTP/1.0\r\n\r\n' >&3 2>/dev/null || true
+    IFS= read -r -u 3 -t 5 line || true
+    exec 3>&-
+    [ -n "$line" ] || return 2
+    printf '%s\n' "$line"
+}
+
+# Status line -> HTTP code ("HTTP/1.0 200 OK" -> 200); anything non-HTTP or
+# empty becomes something that is never "200", so callers can just compare.
+ui_health_code() {
+    local status="${1%%$'\r'}"
+    status="${status#* }"   # drop "HTTP/1.x"
+    status="${status%% *}"  # keep the code word only
+    printf '%s\n' "$status"
+}
+
+# Open the control panel as a desktop window. Wayland first-class here
+# (WAYLAND_DISPLAY set): chromium/google-chrome-stable --app gives a standalone
+# window, and --class sets the Wayland app_id — Hyprland matches windowrules
+# against it (class samsung-cast; see the float rule documented in README).
+# No --ozone-platform flags: modern Chromium auto-detects Wayland. Firefox has
+# no app mode — a plain new window. setsid + silenced stdio: fire-and-forget,
+# the window must survive this script's exit and its Ctrl-C (a new session
+# keeps it out of the terminal's SIGINT process group). No browser at all:
+# cmd_ui has already printed the URL, just say so.
+ui_open_window() {
+    local url="$1"
+    if command -v chromium >/dev/null 2>&1; then
+        setsid chromium --app="$url" --class=samsung-cast </dev/null >/dev/null 2>&1 &
+    elif command -v google-chrome-stable >/dev/null 2>&1; then
+        setsid google-chrome-stable --app="$url" --class=samsung-cast </dev/null >/dev/null 2>&1 &
+    elif command -v firefox >/dev/null 2>&1; then
+        setsid firefox --new-window "$url" </dev/null >/dev/null 2>&1 &
+    else
+        echo "samsung-cast: no chromium/google-chrome/firefox found — open $url in a browser" >&2
+    fi
+}
+
+# --browser: skip the app window, hand the URL to the desktop default handler.
+ui_open_browser_tab() {
+    local url="$1"
+    setsid xdg-open "$url" </dev/null >/dev/null 2>&1 &
+}
+
+# Desktop entry so wofi/rofi/app-grids list "Samsung Cast". Exec carries the
+# ABSOLUTE samcast path: launchers do not share this shell's cwd. Idempotent —
+# rewritten only when missing or differing (differing content is updated: this
+# file is ours to own); byte-identical content means no rewrite churn, which
+# launchers watching directory mtimes appreciate. Icon=video-display is a
+# freedesktop-standard name, always resolvable. Only the file written here is
+# ever chmodded.
+ensure_desktop_entry() {
+    local dir="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+    local file="$dir/samsung-cast.desktop"
+    local want have
+    want="[Desktop Entry]
+Type=Application
+Name=Samsung Cast
+Exec=$SCRIPT_DIR/samcast ui
+Terminal=false
+Categories=Utility;AudioVideo
+Icon=video-display
+StartupWMClass=samsung-cast"
+    mkdir -p "$dir"
+    have="$(cat "$file" 2>/dev/null || true)"
+    if [ "$have" = "$want" ]; then
+        return 0
+    fi
+    printf '%s\n' "$want" > "$file"
+    chmod 644 "$file"
+    echo "samsung-cast: wrote $file"
+}
+
+# samcast ui — serve the control panel (bin/samcast-ui, built by make) and
+# open its window. The server binds 127.0.0.1 only: no auth, same-user
+# same-machine trust. An instance already listening is reused after a 200 on
+# /api/health; a port answering anything else belongs to someone else —
+# refused with a port hint, never killed.
+cmd_ui() {
+    local port=8791 open=app   # open: app window | browser tab | none (--no-open)
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --port)
+                [ $# -ge 2 ] || die "--port needs a number"
+                case "$2" in ''|*[!0-9]*) die "--port wants a number, got '$2'" ;; esac
+                port="$2"
+                shift
+                ;;
+            --no-open) open=none ;;
+            --browser) open=browser ;;
+            *) die "unknown argument: $1" ;;
+        esac
+        shift
+    done
+    local url="http://127.0.0.1:$port"
+
+    [ -x "$UI_BIN" ] || die "UI server not built — run: make"
+    ensure_desktop_entry
+
+    # Reuse probe BEFORE starting: 200 on /api/health means a server of ours
+    # is already up (an earlier samcast ui / launcher run) — just show the
+    # window. Refused = free port, start one below. Any other answer, or a
+    # port that accepts without speaking HTTP, is something else: die rather
+    # than kill it or stack a second server on top.
+    local status="" rc=0 code ui_pid=""
+    status="$(ui_health_status "$port")" || rc=$?
+    if [ "$rc" -eq 0 ] && [ "$(ui_health_code "$status")" != "200" ]; then
+        die "port $port is in use by something else (try: samcast ui --port N)"
+    elif [ "$rc" -eq 2 ]; then
+        die "port $port is in use by something else (try: samcast ui --port N)"
+    fi
+
+    if [ "$rc" -ne 0 ]; then  # refused — free port, ours to claim
+        echo "samsung-cast: starting UI server on $url"
+        # Not exec: the window may only open once /api/health answers, and
+        # wait below keeps Ctrl-C killing both this script and the server.
+        "$UI_BIN" --samcast "$SCRIPT_DIR/samcast" --ctl "$CTL" --addr "127.0.0.1:$port" &
+        ui_pid=$!
+        trap 'kill "$ui_pid" 2>/dev/null || true' EXIT
+        local up=""
+        for _ in $(seq 1 50); do
+            sleep 0.1
+            kill -0 "$ui_pid" 2>/dev/null || break  # died at bind — its error is on our stderr
+            status="$(ui_health_status "$port")" || true
+            if [ -n "$status" ] && [ "$(ui_health_code "$status")" = "200" ]; then
+                up=1
+                break
+            fi
+        done
+        [ -n "$up" ] || die "UI server did not come up on $url (its error is above; try: samcast ui --port N)"
+    fi
+
+    echo "samsung-cast UI: $url"
+    case "$open" in
+        app)     ui_open_window "$url" ;;
+        browser) ui_open_browser_tab "$url" ;;
+        none)    ;;  # --no-open: URL printed above, nothing opened
+    esac
+
+    # A reused server is not ours to hold (exit 0 immediately); ours is held:
+    # this foreground wait is what keeps Ctrl-C taking the server down too.
+    if [ -n "$ui_pid" ]; then
+        wait "$ui_pid"
+    fi
+}
+
 cmd="${1:-}"; shift || true
 case "$cmd" in
     discover) cmd_discover ;;
@@ -493,14 +772,15 @@ case "$cmd" in
     stop)     cmd_stop ;;
     status)   cmd_status ;;
     devices)  cmd_devices ;;
-    monitors) cmd_monitors ;;
+    monitors) cmd_monitors "$@" ;;
     monitor)  cmd_monitor "$@" ;;
-    tvs)      cmd_tvs ;;
+    tvs)      cmd_tvs "$@" ;;
     tv)       cmd_tv "$@" ;;
     on)       cmd_on "$@" ;;
     mirror)   cmd_on "$@" ;;
     off)      cmd_off ;;
     toggle)   cmd_toggle ;;
     log)      cmd_log "$@" ;;
+    ui)       cmd_ui "$@" ;;
     *)        usage; [ "$cmd" = "" ] || die "unknown command: $cmd" ;;
 esac

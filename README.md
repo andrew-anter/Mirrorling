@@ -19,10 +19,11 @@ lifecycle, config, toggle keybind.
 ## Layout
 
 ```
-samcast              CLI: discover / tvs / tv / pair / start / on / mirror / off / toggle / status / log
+samcast              CLI: discover / tvs / tv / pair / start / on / mirror / off / toggle / status / log / ui
 samcast-picker       headless monitor picker run by xdg-desktop-portal-hyprland per cast (Wayland)
-Makefile             builds the fork from ../doubletake-samsung (override: make VENDOR=...), symlinks bin/
-bin/                 build output symlinks (not tracked)
+ui/                  Go control-panel server — served + windowed by `samcast ui` (built to bin/samcast-ui)
+Makefile             builds the fork from ../doubletake-samsung (override: make VENDOR=...) + ui/, symlinks bin/
+bin/                 build output symlinks + samcast-ui (not tracked)
 docs/                protocol findings for this TV
 ~/.config/samsung-cast/config   name/FPS/encoder/port-range/monitor (written on first run)
 ```
@@ -108,12 +109,60 @@ them. Setting a name that is currently unreachable still works (standby drops th
 samcast warns and pins it for later. A TV only ever needs `./samcast pair` once — pairing
 credentials are per-TV — before `samcast on` can mirror to it.
 
+Picked TVs are also remembered in `~/.config/samsung-cast/tvs` (one name per line,
+most-recently-used first): `samcast tvs` keeps listing those names even while their TV is off
+the network — marked `saved — not on the network` — so standby never makes a known TV vanish,
+and picking a saved one just pins it for when it wakes. `./samcast tv --forget <NAME>` removes
+a name from that list; the configured TV itself stays set (with a note when the forgotten name
+is the configured one).
+
 When the configured TV is unreachable while other Samsung receivers are in sight, a run in a
 terminal (`samcast on`/`toggle`/`pair`/`target`) prints the TVs it sees, numbered, and offers to
 switch: a valid pick is persisted and the cast proceeds against it. The prompt deliberately has
 no default — empty or invalid input falls back to the usual "'…' not found on the network"
 failure, and non-interactive runs (a keybound `toggle`, scripts) never prompt at all, so nothing
 ever starts casting to another room's TV by surprise.
+
+## Control panel (UI)
+
+`samcast ui` serves a small Go control panel (source in `ui/`, built to `bin/samcast-ui` by
+`make`) on `http://127.0.0.1:8791` and opens it as a standalone desktop window — the same daily
+controls (TV, monitor, daemon, mirror on/off) against the same config and ctl socket as the CLI:
+
+```sh
+./samcast ui                # serve + open the control window (Ctrl-C stops the server)
+./samcast ui --port 8800    # listen elsewhere
+./samcast ui --browser      # plain browser tab (xdg-open) instead of the app window
+./samcast ui --no-open      # start the server, print the URL only
+```
+
+It also appears in desktop launchers (wofi/rofi/app grid) as **Samsung Cast**: every `samcast ui`
+run writes `~/.local/share/applications/samsung-cast.desktop` — only when missing or stale
+(`Exec` carries an absolute path, since launchers share no cwd with your shell). In the TV list,
+saved/offline TVs stay visible, dimmed, each with a small forget button.
+
+- **Reuse, never double-start:** before starting anything, samcast probes `GET /api/health` on
+  the port. Something already answering 200 is reused — the window opens and `samcast ui` exits
+  0. Anything else holding the port (404, non-HTTP, accept-but-silent) fails with
+  "port … is in use by something else (try: samcast ui --port N)"; nothing is ever killed.
+- **Localhost-only, no auth:** the server binds `127.0.0.1` and trusts the same user on the same
+  machine — keep it that way (do not expose or port-forward it).
+- **PIN pairing happens in-page:** a first-time cast leaves the daemon's connection in a waiting
+  state and the panel asks for the PIN the TV shows, submitting it through the same ctl socket
+  `samcast` uses.
+- **Window rules (optional, not applied automatically):** the app window advertises the class
+  `samsung-cast` — what Hyprland `windowrulev2` matches against — so for a tidy floating panel
+  add to `~/.config/hypr/hyprland.conf`:
+  ```ini
+  windowrulev2 = float, class:^(samsung-cast)$
+  windowrulev2 = size 480 720, class:^(samsung-cast)$   # optional
+  windowrulev2 = center, class:^(samsung-cast)$         # optional
+  ```
+
+The panel reads the CLI's machine-readable modes (handy in scripts too): `samcast tvs --raw` /
+`samcast monitors --raw` print plain lists — dying exactly like their interactive forms when
+nothing is discovered — while `samcast tv --raw` prints the configured TV name and
+`samcast monitor --raw` prints the pinned monitor or `auto`.
 
 ## Tuning
 

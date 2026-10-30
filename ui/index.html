@@ -1,0 +1,783 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>samcast — samsung-cast</title>
+<style>
+  :root {
+    --bg: #0e1114;
+    --panel: #151a20;
+    --panel-2: #1a2028;
+    --seam: #262e37;
+    --ink: #e7ecef;
+    --dim: #8a94a0;
+    --faint: #59636e;
+    --green: #46c46e;
+    --amber: #e0a63d;
+    --blue: #4f9eea;
+    --grey: #78828c;
+    --red: #e26d5a;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: radial-gradient(1100px 380px at 50% -80px, #131a21, var(--bg)) fixed;
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 15px;
+    line-height: 1.45;
+    min-height: 100vh;
+  }
+  button {
+    font: inherit;
+    color: inherit;
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 0;
+  }
+  :focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; border-radius: 6px; }
+
+  .wrap { max-width: 660px; margin: 0 auto; padding: 0 18px 28px; }
+
+  /* ---------- header ---------- */
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 18px 2px 14px;
+    border-bottom: 1px solid var(--seam);
+  }
+  .wordmark {
+    font-family: var(--mono);
+    font-size: 13px;
+    letter-spacing: 0.28em;
+    color: var(--ink);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .wordmark small { letter-spacing: 0.08em; color: var(--faint); font-size: 11px; }
+  .led { width: 8px; height: 8px; border-radius: 50%; background: var(--grey); flex: none; }
+  .led.live  { background: var(--green); box-shadow: 0 0 8px 1px rgba(70,196,110,.55); }
+  .led.busy  { background: var(--amber); box-shadow: 0 0 8px 1px rgba(224,166,61,.5); animation: breathe 1.6s ease-in-out infinite; }
+  .led.warn  { background: var(--blue);  box-shadow: 0 0 8px 1px rgba(79,158,234,.5); }
+  .pill {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--dim);
+    border: 1px solid var(--seam);
+    background: var(--panel);
+    padding: 6px 12px;
+    border-radius: 999px;
+    max-width: 70%;
+    overflow: hidden;
+  }
+  .pill .txt { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .pill.live .txt { color: var(--ink); }
+  .pill.warn .txt { color: var(--blue); }
+  .pill.busy .txt { color: var(--amber); }
+  .pill .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--grey); flex: none; }
+  .pill.live .dot  { background: var(--green); box-shadow: 0 0 8px 1px rgba(70,196,110,.55); }
+  .pill.busy .dot  { background: var(--amber); animation: breathe 1.6s ease-in-out infinite; }
+  .pill.warn .dot  { background: var(--blue);  animation: breathe 1.2s ease-in-out infinite; }
+  @keyframes breathe { 50% { opacity: 0.35; box-shadow: none; } }
+
+  /* ---------- hero: the link line + the one big button ---------- */
+  .beam { display: flex; align-items: flex-end; gap: 12px; padding: 34px 4px 6px; color: var(--faint); }
+  .beam svg { width: 38px; height: 26px; flex: none; stroke: currentColor; }
+  .beam .track { position: relative; flex: 1; height: 2px; margin-bottom: 12px; }
+  .beam .line {
+    position: absolute; inset: 0;
+    background: repeating-linear-gradient(90deg, var(--seam) 0 6px, transparent 6px 13px);
+  }
+  .beam .flow {
+    position: absolute; top: -1px; height: 4px; width: 34%;
+    background: linear-gradient(90deg, transparent, var(--amber), transparent);
+    animation: cast-x 1.3s linear infinite;
+    display: none;
+  }
+  .beam .sheen {
+    position: absolute; top: -1px; height: 4px; width: 26%;
+    background: linear-gradient(90deg, transparent, var(--green), transparent);
+    animation: cast-x 2.4s linear infinite;
+    display: none;
+  }
+  @keyframes cast-x { from { left: -34%; } to { left: 100%; } }
+  .beam[data-state="down"] svg { opacity: 0.4; }
+  .beam[data-state="down"] .track { opacity: 0.3; }
+  .beam[data-state="discovering"] .flow,
+  .beam[data-state="connecting"] .flow { display: block; }
+  .beam[data-state="discovering"] svg,
+  .beam[data-state="connecting"] svg { color: var(--amber); }
+  .beam[data-state="streaming"] svg { color: var(--green); }
+  .beam[data-state="streaming"] .line {
+    background: repeating-linear-gradient(90deg, rgba(70,196,110,.75) 0 10px, rgba(70,196,110,.18) 10px 13px);
+  }
+  .beam[data-state="streaming"] .sheen { display: block; }
+  .beam[data-state="pin_required"] svg { color: var(--blue); animation: breathe 1.2s ease-in-out infinite; }
+  .beam[data-state="pin_required"] .line {
+    background: repeating-linear-gradient(90deg, rgba(79,158,234,.8) 0 10px, rgba(79,158,234,.2) 10px 13px);
+  }
+  .beamlabels {
+    display: flex;
+    justify-content: space-between;
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--dim);
+    padding: 2px 4px 18px;
+  }
+  .beamlabels .tvlabel { color: var(--ink); }
+
+  .hero-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    width: 100%;
+    padding: 22px 20px;
+    font-size: 19px;
+    font-weight: 650;
+    letter-spacing: 0.02em;
+    color: var(--ink);
+    background: linear-gradient(180deg, var(--panel-2), var(--panel));
+    border: 1px solid var(--seam);
+    border-radius: 14px;
+    box-shadow: 0 10px 26px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.04);
+    transition: border-color .15s ease, transform .06s ease;
+  }
+  .hero-btn:hover:not(:disabled) { border-color: var(--faint); }
+  .hero-btn:active:not(:disabled) { transform: translateY(1px); }
+  .hero-btn:disabled { cursor: default; opacity: 0.75; }
+  .hero-btn.stop { color: var(--dim); background: var(--panel); border-color: var(--seam); box-shadow: none; }
+  .hero-btn.stop:hover:not(:disabled) { color: var(--ink); border-color: var(--faint); }
+  .spin {
+    width: 17px; height: 17px; flex: none;
+    border: 2px solid var(--faint);
+    border-top-color: var(--ink);
+    border-radius: 50%;
+    animation: rot 0.8s linear infinite;
+  }
+  @keyframes rot { to { transform: rotate(360deg); } }
+
+  .herorow {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    min-height: 34px;
+    padding-top: 10px;
+  }
+  .chip {
+    font-size: 13px;
+    color: var(--dim);
+    border: 1px solid var(--seam);
+    background: var(--panel);
+    padding: 6px 14px;
+    border-radius: 999px;
+    transition: color .15s ease, border-color .15s ease;
+  }
+  .chip:hover:not(:disabled) { color: var(--ink); border-color: var(--faint); }
+  .chip:disabled { opacity: 0.6; cursor: default; }
+  .statenote { font-family: var(--mono); font-size: 11px; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  /* ---------- cards ---------- */
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--seam);
+    border-radius: 12px;
+    padding: 14px 16px 12px;
+    margin-top: 16px;
+  }
+  .cardhead {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    margin-bottom: 8px;
+  }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--dim);
+  }
+  .ghost {
+    font-size: 12px;
+    color: var(--faint);
+    padding: 2px 6px;
+    border-radius: 6px;
+  }
+  .ghost:hover { color: var(--ink); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 14px; }
+  .grid .card { margin-top: 16px; }
+
+  .picklist { display: flex; flex-direction: column; gap: 4px; max-height: 230px; overflow-y: auto; }
+  .pick {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    text-align: left;
+    padding: 9px 10px;
+    border-radius: 9px;
+    border: 1px solid transparent;
+  }
+  .pick:hover { background: var(--panel-2); }
+  .pick[aria-checked="true"] { border-color: var(--seam); background: var(--panel-2); }
+  .pick-row { display: flex; align-items: stretch; gap: 4px; }
+  .pick-row .pick { flex: 1; min-width: 0; }
+  .ghost.forget { align-self: center; font-size: 15px; line-height: 1; padding: 6px 10px; }
+  .pick-dot {
+    width: 9px; height: 9px; flex: none;
+    border-radius: 50%;
+    border: 1px solid var(--faint);
+  }
+  .pick[aria-checked="true"] .pick-dot { background: var(--green); border-color: var(--green); box-shadow: 0 0 7px rgba(70,196,110,.5); }
+  .pick.offline { opacity: 0.6; }  /* saved TV, not on the network — dot still reads */
+  .pick-main { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+  .pick-name { font-weight: 600; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .pick-meta { font-family: var(--mono); font-size: 11px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .pick-now { font-family: var(--mono); font-size: 10px; letter-spacing: 0.1em; color: var(--faint); text-transform: uppercase; }
+  .note { margin: 6px 2px 2px; font-size: 13px; color: var(--dim); }
+  .note.err { color: var(--amber); }
+  .note .detail { display: block; font-family: var(--mono); font-size: 11px; color: var(--faint); margin-top: 2px; word-break: break-word; }
+
+  /* ---------- pin card ---------- */
+  .pinform { display: flex; gap: 10px; align-items: center; padding: 4px 0 6px; }
+  #pinInput {
+    font-family: var(--mono);
+    font-size: 22px;
+    letter-spacing: 0.35em;
+    color: var(--ink);
+    background: var(--panel-2);
+    border: 1px solid var(--seam);
+    border-radius: 9px;
+    width: 9.5ch;
+    padding: 10px 12px 10px 15px;
+    text-align: center;
+  }
+  #pinInput:focus { outline: none; border-color: var(--blue); }
+  .btn {
+    font-weight: 600;
+    font-size: 14px;
+    padding: 11px 18px;
+    border-radius: 9px;
+    background: var(--panel-2);
+    border: 1px solid var(--seam);
+    transition: border-color .15s ease;
+  }
+  .btn:hover:not(:disabled) { border-color: var(--faint); }
+  .btn:disabled { opacity: 0.6; cursor: default; }
+
+  /* ---------- logs drawer ---------- */
+  .logs { margin-top: 22px; border-top: 1px solid var(--seam); padding-top: 12px; }
+  .logsbar { display: flex; align-items: center; gap: 14px; }
+  .logsbar .eyebrow { cursor: pointer; }
+  .logsbar .eyebrow:hover { color: var(--ink); }
+  .logsbar label {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--dim);
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    margin-left: auto;
+  }
+  #logsPre {
+    margin: 10px 0 0;
+    padding: 12px 14px;
+    background: var(--panel);
+    border: 1px solid var(--seam);
+    border-radius: 10px;
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.55;
+    color: var(--dim);
+    max-height: 260px;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  /* ---------- toasts ---------- */
+  #toasts {
+    position: fixed;
+    right: 16px;
+    bottom: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-width: min(420px, calc(100vw - 32px));
+    z-index: 10;
+  }
+  .toast {
+    background: var(--panel-2);
+    border: 1px solid var(--seam);
+    border-left: 3px solid var(--green);
+    color: var(--ink);
+    font-size: 13px;
+    padding: 10px 14px;
+    border-radius: 9px;
+    box-shadow: 0 8px 24px rgba(0,0,0,.45);
+    word-break: break-word;
+    animation: rise .18s ease-out;
+  }
+  .toast.err { border-left-color: var(--red); color: var(--ink); }
+  .toast.out { opacity: 0; transition: opacity .25s ease; }
+  @keyframes rise { from { transform: translateY(8px); opacity: 0; } }
+
+  @media (prefers-reduced-motion: reduce) {
+    .flow, .sheen, .led.busy, .pill .dot, .spin, .beam[data-state="pin_required"] svg, .toast { animation: none !important; }
+    .toast { transition: none; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="wordmark"><span class="led" id="wmLed"></span>samcast&nbsp;<small>samsung-cast</small></div>
+    <div class="pill" id="pill"><span class="dot"></span><span class="txt" id="pillText"></span></div>
+  </header>
+
+  <main>
+    <section class="hero" aria-label="Mirroring">
+      <div class="beam" id="beam" data-state="down" aria-hidden="true">
+        <svg viewBox="0 0 38 26" fill="none" stroke-width="1.6" stroke-linecap="round">
+          <rect x="8" y="3" width="22" height="14" rx="1.8"/>
+          <path d="M4 22.5 h30 l-2.5 -3.5 h-25 z"/>
+        </svg>
+        <div class="track"><div class="line"></div><div class="flow"></div><div class="sheen"></div></div>
+        <svg viewBox="0 0 38 26" fill="none" stroke-width="1.6" stroke-linecap="round">
+          <rect x="5" y="3" width="28" height="17" rx="2"/>
+          <path d="M14 24.5 h10"/>
+        </svg>
+      </div>
+      <div class="beamlabels"><span>this machine</span><span class="tvlabel" id="beamTv"></span></div>
+
+      <button class="hero-btn" id="heroBtn"><span class="lbl" id="heroLbl"></span></button>
+      <div class="herorow">
+        <button class="chip" id="muteBtn" hidden></button>
+        <span class="statenote" id="stateNote"></span>
+      </div>
+    </section>
+
+    <section class="card" id="pinCard" hidden>
+      <div class="cardhead"><span class="eyebrow">Pairing</span></div>
+      <p class="note" style="margin-top:0">Enter the PIN shown on the TV.</p>
+      <form class="pinform" id="pinForm">
+        <input id="pinInput" autocomplete="off" maxlength="16" placeholder="····" aria-label="Pairing PIN or password">
+        <button class="btn" id="pinBtn" type="submit">Submit PIN</button>
+      </form>
+    </section>
+
+    <div class="grid">
+      <section class="card">
+        <div class="cardhead">
+          <span class="eyebrow">TV</span>
+          <button class="ghost" id="tvsRefresh">Refresh</button>
+        </div>
+        <div class="picklist" id="tvList" role="radiogroup" aria-label="TV to cast to"></div>
+        <p class="note" id="tvNote" hidden></p>
+      </section>
+
+      <section class="card">
+        <div class="cardhead">
+          <span class="eyebrow">Monitor</span>
+          <button class="ghost" id="monRefresh">Refresh</button>
+        </div>
+        <div class="picklist" id="monList" role="radiogroup" aria-label="Monitor to capture"></div>
+        <p class="note" id="monNote" hidden></p>
+      </section>
+    </div>
+  </main>
+
+  <section class="logs">
+    <div class="logsbar">
+      <span class="eyebrow" id="logsToggle" role="button" tabindex="0" aria-expanded="false">Daemon logs ▸</span>
+      <span id="logsControls" hidden>
+        <button class="ghost" id="logsRefresh">Refresh</button>
+        <label><input type="checkbox" id="followChk"> follow</label>
+      </span>
+    </div>
+    <pre id="logsPre" hidden></pre>
+  </section>
+
+</div>
+<div id="toasts" role="status" aria-live="polite"></div>
+
+<script>
+'use strict';
+
+var $ = function (id) { return document.getElementById(id); };
+
+function el(tag, cls, text) {
+  var n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined) n.textContent = text;
+  return n;
+}
+
+async function getJSON(path) {
+  var r = await fetch(path);
+  return r.json();
+}
+
+async function postJSON(path, body) {
+  try {
+    var r = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {})
+    });
+    return await r.json();
+  } catch (e) {
+    return { ok: false, output: 'request failed: ' + e.message };
+  }
+}
+
+function toast(msg, isErr) {
+  var t = el('div', 'toast' + (isErr ? ' err' : ''), msg);
+  $('toasts').append(t);
+  setTimeout(function () {
+    t.classList.add('out');
+    setTimeout(function () { t.remove(); }, 280);
+  }, 4500);
+}
+
+/* ---------- state polling ---------- */
+
+var state = null;        // last /api/state payload
+var pollBusy = false;
+var heroPending = null;  // 'on' | 'off' | 'start' | null
+var pinPending = false;
+var mutePending = false;
+var pinWasShown = false;
+
+function ctl() { return state && state.ctl ? state.ctl : null; }
+function phase() {
+  var c = ctl();
+  if (!c) return 'down';
+  return c.state || 'idle';
+}
+
+async function pollState() {
+  if (pollBusy || document.hidden) return;
+  pollBusy = true;
+  try {
+    var j = await getJSON('/api/state');
+    if (j && typeof j === 'object') { state = j; render(); }
+  } catch (e) { /* server gone — the page dies with it */ }
+  pollBusy = false;
+}
+
+setInterval(function () { if (!document.hidden) pollState(); }, 2000);
+document.addEventListener('visibilitychange', function () {
+  if (!document.hidden) pollState();
+});
+
+/* ---------- rendering ---------- */
+
+function render() {
+  var c = ctl();
+  var ph = phase();
+  var pill = $('pill');
+  var cls = { down: '', idle: '', discovering: 'busy', connecting: 'busy', streaming: 'live', pin_required: 'warn' }[ph] || '';
+  pill.className = 'pill' + (cls ? ' ' + cls : '');
+  $('wmLed').className = 'led' + (cls ? ' ' + cls : '');
+
+  var pillText = {
+    down: 'daemon stopped',
+    idle: 'idle',
+    discovering: 'discovering…',
+    connecting: 'connecting…',
+    streaming: 'casting to ' + (c && c.device ? c.device : 'TV'),
+    pin_required: 'waiting for PIN'
+  }[ph];
+  $('pillText').textContent = pillText || '';
+
+  $('beam').dataset.state = ph;
+
+  var tvName = (c && c.device) || (state && state.configured_tv) || '';
+  $('beamTv').textContent = tvName || 'no TV set';
+
+  // hero button
+  var btn = $('heroBtn');
+  var lbl = $('heroLbl');
+  var action = ph === 'down' ? 'start' : (ph === 'idle' ? 'on' : 'off');
+  var label = { start: 'Start daemon', on: 'Start mirroring', off: 'Stop' }[action];
+  btn.className = 'hero-btn' + (action === 'off' ? ' stop' : '');
+  btn.disabled = !!heroPending;
+  // one persistent spinner — render() runs every poll, prepending would stack
+  var spin = btn.querySelector('.spin');
+  if (heroPending && !spin) btn.prepend(el('span', 'spin'));
+  if (!heroPending && spin) spin.remove();
+  lbl.textContent = heroPending ? 'Working…' : label;
+
+  // daemon error, when the ctl reports one
+  $('stateNote').textContent = c && c.error ? c.error : '';
+
+  // mute — only meaningful while streaming
+  var muteBtn = $('muteBtn');
+  var stream = c && Array.isArray(c.streams) && c.streams.length ? c.streams[0] : null;
+  var muted = stream ? !!stream.audio_muted : !!(c && c.audio_muted);
+  if (ph === 'streaming') {
+    muteBtn.hidden = false;
+    muteBtn.disabled = mutePending;
+    muteBtn.textContent = muted ? 'Unmute audio' : 'Mute audio';
+    muteBtn.dataset.muted = muted ? '1' : '';
+  } else {
+    muteBtn.hidden = true;
+  }
+
+  // PIN card
+  var showPin = ph === 'pin_required' || !!(c && c.needs_pin);
+  var pinCard = $('pinCard');
+  pinCard.hidden = !showPin;
+  $('pinBtn').disabled = pinPending;
+  if (showPin && !pinWasShown) $('pinInput').focus();
+  pinWasShown = showPin;
+
+  // config markers on the pick lists (cheap — from the poll, no refetch)
+  markPicks();
+}
+
+/* ---------- TV + monitor pick lists ---------- */
+
+var tvs = null, monitors = null;      // last fetched rows
+var tvsError = '', monitorsError = '';
+var pickBusy = false;
+
+function markPicks() {
+  var curTV = state && state.configured_tv ? state.configured_tv : '';
+  var curMon = state && state.configured_monitor ? state.configured_monitor : 'auto';
+  paintPicks($('tvList'), curTV, 'tv');
+  paintPicks($('monList'), curMon, 'monitor');
+}
+
+function paintPicks(listEl, current, kind) {
+  var rows = kind === 'tv' ? tvs : monitors;
+  if (!rows) return; // not fetched yet — poll marker pass skipped
+  listEl.textContent = '';
+  if (kind === 'monitor') {
+    rows = [{ name: 'auto', label: 'Auto — share-picker dialog each cast' }].concat(
+      rows.map(function (m) { return { name: m, label: m }; })
+    );
+  }
+  rows.forEach(function (row) {
+    var name = row.name;
+    var offline = kind === 'tv' && row.state === 'saved';
+    var isCur = name === current || (kind === 'monitor' && name === 'auto' && current === 'auto');
+    var b = el('button', 'pick' + (offline ? ' offline' : ''));
+    b.type = 'button';
+    b.setAttribute('role', 'radio');
+    b.setAttribute('aria-checked', isCur ? 'true' : 'false');
+    b.append(el('span', 'pick-dot'));
+    var main = el('span', 'pick-main');
+    main.append(el('span', 'pick-name', kind === 'monitor' ? row.label : name));
+    if (kind === 'tv') {
+      // a saved row carries no ip/model — it is remembered, not on the network
+      var meta = offline ? 'saved — not on the network'
+        : [row.ip, row.model].filter(Boolean).join(' · ');
+      if (meta) main.append(el('span', 'pick-meta', meta));
+    }
+    b.append(main);
+    if (isCur) b.append(el('span', 'pick-now', 'selected'));
+    b.addEventListener('click', function () { pick(kind, name); });
+    if (!offline) {
+      listEl.append(b);
+      return;
+    }
+    // a forget button may NOT nest inside the row button (invalid HTML, and
+    // nested buttons break keyboard focus order) — the row becomes a wrapper
+    var rowWrap = el('div', 'pick-row');
+    rowWrap.append(b);
+    var forget = el('button', 'ghost forget', '×');
+    forget.type = 'button';
+    forget.setAttribute('aria-label', 'Forget ' + name);
+    forget.addEventListener('click', function () { forgetTV(name); });
+    rowWrap.append(forget);
+    listEl.append(rowWrap);
+  });
+}
+
+function setListNote(noteEl, emptyText, err) {
+  // the empty state is always shown; the stderr detail rides along when the
+  // listing itself failed (exit != 0) rather than merely finding nothing
+  noteEl.hidden = false;
+  noteEl.className = 'note' + (err ? ' err' : '');
+  noteEl.textContent = emptyText;
+  if (err) noteEl.append(el('span', 'detail', err));
+}
+
+async function fetchTVs() {
+  try {
+    var j = await getJSON('/api/tvs');
+    tvs = (j && j.tvs) || [];
+    tvsError = (j && j.error) || '';
+  } catch (e) { return; }
+  if (!tvs.length) setListNote($('tvNote'), 'no TVs found — is one powered on?', tvsError);
+  else $('tvNote').hidden = true;
+  markPicks();
+}
+
+async function fetchMonitors() {
+  try {
+    var j = await getJSON('/api/monitors');
+    monitors = (j && j.monitors) || [];
+    monitorsError = (j && j.error) || '';
+  } catch (e) { return; }
+  if (!monitors.length) setListNote($('monNote'), 'no monitors found — Wayland needs hyprctl, X11 needs xrandr.', monitorsError);
+  else $('monNote').hidden = true;
+  markPicks();
+}
+
+function refreshLists() { fetchTVs(); fetchMonitors(); }
+
+async function pick(kind, name) {
+  if (pickBusy) return;
+  var current = kind === 'tv'
+    ? (state && state.configured_tv ? state.configured_tv : '')
+    : (state && state.configured_monitor ? state.configured_monitor : 'auto');
+  if (name === current) return;
+  pickBusy = true;
+  var j = await postJSON('/api/' + kind, { name: name });
+  pickBusy = false;
+  if (j.ok) {
+    toast(kind === 'tv' ? 'TV set to ' + name : 'Monitor set to ' + name);
+  } else {
+    toast((j.output || 'failed'), true);
+  }
+  pollState();
+  if (kind === 'tv') fetchTVs(); else fetchMonitors();
+}
+
+// drop a saved TV from the remembered list; the configured TV stays as it is
+async function forgetTV(name) {
+  var j = await postJSON('/api/tv/forget', { name: name });
+  if (!j.ok) toast(j.output || 'failed', true);
+  fetchTVs();
+  pollState();
+}
+
+/* ---------- actions ---------- */
+
+$('heroBtn').addEventListener('click', async function () {
+  if (heroPending) return;
+  var ph = phase();
+  var action = ph === 'down' ? 'start' : (ph === 'idle' ? 'on' : 'off');
+  heroPending = action;
+  render();
+  var j = await postJSON('/api/' + action);
+  heroPending = null;
+  if (j.ok) {
+    toast(action === 'off' ? 'Mirroring stopped' : action === 'start' ? 'Daemon started' : 'Mirroring started');
+  } else {
+    toast(j.output || 'failed', true);
+  }
+  render();
+  pollState();
+  refreshLists();
+});
+
+$('muteBtn').addEventListener('click', async function () {
+  if (mutePending) return;
+  var muted = !!$('muteBtn').dataset.muted;
+  mutePending = true;
+  render();
+  var j = await postJSON(muted ? '/api/unmute' : '/api/mute');
+  mutePending = false;
+  if (!j.ok) toast(j.output || 'failed', true);
+  render();
+  pollState();
+});
+
+$('pinForm').addEventListener('submit', async function (e) {
+  e.preventDefault();
+  if (pinPending) return;
+  var pin = $('pinInput').value.trim();
+  // onscreen PINs are 4-6 digits, but a password-protected TV (Require
+  // Password) lands in the same waiting state — accept alphanumeric too
+  if (!/^[A-Za-z0-9]{4,16}$/.test(pin)) {
+    toast('Enter the PIN shown on the TV (4–6 digits, or the TV password)', true);
+    return;
+  }
+  pinPending = true;
+  render();
+  var j = await postJSON('/api/pin', { pin: pin });
+  pinPending = false;
+  if (j.ok) {
+    $('pinInput').value = '';
+    toast('PIN submitted');
+    pollState();
+  } else {
+    toast(j.output || 'PIN rejected', true);
+  }
+  render();
+});
+
+$('pinInput').addEventListener('input', function () {
+  this.value = this.value.replace(/[^A-Za-z0-9]/g, '');
+});
+
+$('tvsRefresh').addEventListener('click', fetchTVs);
+$('monRefresh').addEventListener('click', fetchMonitors);
+
+/* ---------- logs drawer ---------- */
+
+var logsOpen = false;
+var followTimer = null;
+
+function setFollow(on) {
+  if (followTimer) { clearInterval(followTimer); followTimer = null; }
+  if (on) followTimer = setInterval(fetchLogs, 3000);
+}
+
+async function fetchLogs() {
+  if (!logsOpen) return;
+  var j;
+  try { j = await getJSON('/api/logs?lines=200'); } catch (e) { return; }
+  var lines = (j && j.lines) || [];
+  var text = lines.length ? lines.join('\n') : (j && j.error ? 'journalctl: ' + j.error : '(no logs)');
+  var pre = $('logsPre');
+  var stick = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 4;
+  pre.textContent = text;
+  if (stick) pre.scrollTop = pre.scrollHeight;
+}
+
+function toggleLogs(open) {
+  logsOpen = open;
+  $('logsPre').hidden = !open;
+  $('logsControls').hidden = !open;
+  $('logsToggle').textContent = open ? 'Daemon logs ▾' : 'Daemon logs ▸';
+  $('logsToggle').setAttribute('aria-expanded', open ? 'true' : 'false');
+  if (open) {
+    fetchLogs();
+    setFollow($('followChk').checked);
+  } else {
+    setFollow(false);
+  }
+}
+
+$('logsToggle').addEventListener('click', function () { toggleLogs(!logsOpen); });
+$('logsToggle').addEventListener('keydown', function (e) {
+  if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleLogs(!logsOpen); }
+});
+$('logsRefresh').addEventListener('click', fetchLogs);
+$('followChk').addEventListener('change', function () { setFollow(this.checked && logsOpen); });
+
+/* ---------- boot ---------- */
+
+pollState();
+refreshLists();
+</script>
+</body>
+</html>
