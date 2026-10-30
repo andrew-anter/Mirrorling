@@ -671,11 +671,19 @@ ui_open_browser_tab() {
 ensure_desktop_entry() {
     local dir="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
     local file="$dir/samsung-cast.desktop"
+    # Prefer a stable launcher on PATH over $SCRIPT_DIR: when this runs from
+    # the single-file app, SCRIPT_DIR is the cache extraction dir, which
+    # rotates with every image update and can be wiped — an entry pointing
+    # there breaks until a terminal run re-extracts. ~/.local/bin/samcast
+    # re-extracts itself, so the entry survives both.
+    local exec="$SCRIPT_DIR/samcast" onpath
+    onpath="$(command -v samcast 2>/dev/null || true)"
+    [ -n "$onpath" ] && [ "$onpath" != "$SCRIPT_DIR/samcast" ] && exec="$onpath"
     local want have
     want="[Desktop Entry]
 Type=Application
 Name=Samsung Cast
-Exec=$SCRIPT_DIR/samcast ui
+Exec=$exec ui
 Terminal=false
 Categories=Utility;AudioVideo
 Icon=video-display
