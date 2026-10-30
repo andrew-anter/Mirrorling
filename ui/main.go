@@ -48,13 +48,16 @@ func main() {
 		samcast: resolvePath(*samcastFlag, "samcast"),
 		ctl:     resolvePath(*ctlFlag, filepath.Join("bin", "doubletake-ctl")),
 	}
-	for label, p := range map[string]string{"samcast": s.samcast, "doubletake-ctl": s.ctl} {
-		if p == "" {
-			log.Printf("warning: %s path could not be resolved (pass --%s)", label, label)
+	for _, pc := range []struct{ label, flag, path string }{
+		{"samcast", "samcast", s.samcast},
+		{"doubletake-ctl", "ctl", s.ctl},
+	} {
+		if pc.path == "" {
+			log.Printf("warning: %s path could not be resolved (pass --%s)", pc.label, pc.flag)
 			continue
 		}
-		if fi, err := os.Stat(p); err != nil || fi.IsDir() {
-			log.Printf("warning: %s not found at %s — related actions will fail until the path is fixed", label, p)
+		if fi, err := os.Stat(pc.path); err != nil || fi.IsDir() {
+			log.Printf("warning: %s not found at %s — related actions will fail until the path is fixed", pc.label, pc.path)
 		}
 	}
 
@@ -88,12 +91,36 @@ func main() {
 	mux.HandleFunc("/api/logs", s.safe(s.handleLogs))
 
 	log.Printf("samsung-cast ui listening on http://%s", *addrFlag)
+	var handler http.Handler = mux
+	if isLoopbackHost(host) {
+		handler = hostGuard(mux)
+	}
 	srv := &http.Server{
 		Addr:              *addrFlag,
-		Handler:           mux,
+		Handler:           handler,
 		ReadHeaderTimeout: headerTimeout,
 	}
 	log.Fatal(srv.ListenAndServe())
+}
+
+// hostGuard rejects requests whose Host header is not this loopback server:
+// a page can re-resolve its own hostname to 127.0.0.1 (DNS rebinding) and
+// become "same-origin" with the unauthenticated API — the foreign Host header
+// is the tell, and the browser cannot forge it. Only enforced on the default
+// loopback binding; --allow-nonlocal has already widened the model on purpose.
+func hostGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := r.Host
+		if hp, _, err := net.SplitHostPort(h); err == nil {
+			h = hp
+		}
+		if h == "localhost" || (net.ParseIP(h) != nil && net.ParseIP(h).IsLoopback()) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		log.Printf("rejected request with foreign Host %q from %s", r.Host, r.RemoteAddr)
+		writeJSON(w, http.StatusForbidden, map[string]any{"ok": false, "output": "foreign host"})
+	})
 }
 
 // resolvePath returns flagPath when set, otherwise flagPath resolved relative

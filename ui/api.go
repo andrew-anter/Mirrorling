@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"mime"
 	"net/http"
 	"strconv"
 	"strings"
@@ -37,7 +38,17 @@ func methodOnly(w http.ResponseWriter, r *http.Request, method string) bool {
 }
 
 // decodeBody reads a small JSON object into dst; a bad body is a 400.
+//
+// The Content-Type must be application/json: the API is unauthenticated, and
+// a cross-site page can POST text/plain bodies (a no-CORS-preflight form or
+// fetch) — accepting any type would hand every endpoint to any webpage the
+// user visits. The panel itself always sends application/json.
 func decodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
+	mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mt != "application/json" {
+		writeJSON(w, http.StatusUnsupportedMediaType, map[string]any{"ok": false, "output": "Content-Type must be application/json"})
+		return false
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()

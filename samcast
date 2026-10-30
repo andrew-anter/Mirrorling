@@ -90,24 +90,31 @@ die() { echo "samsung-cast: $*" >&2; exit 1; }
 # key is missing (configs written before a feature predate its variable).
 # Callers validate VALUE (monitor names are ^[A-Za-z0-9_-]+$ or empty, TV
 # names via tv_name_ok), so no sed metacharacters can sneak in.
+# flock-serialized: sed -i is a read-modify-write over the whole file, and
+# samcast instances race each other (UI poll, tray action, keybind toggle) —
+# without the lock a concurrent writer's key change is silently dropped.
 set_config_var() {
     local key="$1" value="$2"
-    if grep -q "^${key}=" "$CONF"; then
-        sed -i "s|^${key}=.*|${key}=\"${value}\"|" "$CONF"
-    else
-        printf '%s="%s"\n' "$key" "$value" >> "$CONF"
-    fi
+    (
+        flock 9
+        if grep -q "^${key}=" "$CONF"; then
+            sed -i "s|^${key}=.*|${key}=\"${value}\"|" "$CONF"
+        else
+            printf '%s="%s"\n' "$key" "$value" >> "$CONF"
+        fi
+    ) 9>> "$CONF.lock"
 }
 
 # TV names are free-form mDNS service names (spaces are legitimate — the $4
 # parse already truncates at the first space, a pre-existing limitation), but
 # they land inside a sed replacement and a quoted line of sourced shell: '|'
 # breaks the sed delimiter, '"' breaks the quoting, '\' and '&' are sed
-# replacement metacharacters, a newline would inject a config line. Exactly
-# that set is refused — nothing more.
+# replacement metacharacters, '$' and '`' would execute as command
+# substitution when the config is sourced on every samcast run, and a newline
+# would inject a config line. Exactly that set is refused — nothing more.
 tv_name_ok() {
     case "$1" in
-        *'|'*|*'"'*|*'\'*|*'&'*|*$'\n'*) return 1 ;;
+        *'|'*|*'"'*|*'\'*|*'&'*|*'$'*|*'`'*|*$'\n'*) return 1 ;;
     esac
     return 0
 }
@@ -193,24 +200,32 @@ known_tvs() {
 }
 
 # Prepend NAME, dropping any earlier occurrence (MRU-first). temp+mv in
-# $CONF_DIR keeps an interrupted write from truncating the list.
+# $CONF_DIR keeps an interrupted write from truncating the list; flock keeps a
+# concurrent save (UI pick vs terminal rescue prompt) from dropping one of the
+# two names (both rewrite the whole list).
 save_known_tv() {
     local name="$1"
     mkdir -p "$CONF_DIR"
-    {
-        printf '%s\n' "$name"
-        grep -Fxv -e "$name" "$KNOWN_TVS" 2>/dev/null || true
-    } > "$KNOWN_TVS.tmp.$$"
-    mv "$KNOWN_TVS.tmp.$$" "$KNOWN_TVS"
+    (
+        flock 9
+        {
+            printf '%s\n' "$name"
+            grep -Fxv -e "$name" "$KNOWN_TVS" 2>/dev/null || true
+        } > "$KNOWN_TVS.tmp.$$"
+        mv "$KNOWN_TVS.tmp.$$" "$KNOWN_TVS"
+    ) 9>> "$KNOWN_TVS.lock"
 }
 
 # Drop every exact-line match for NAME; forgetting a name that is not saved
-# is a no-op, not an error.
+# is a no-op, not an error. Same lock as save_known_tv: both rewrite the list.
 forget_known_tv() {
     local name="$1"
     [ -f "$KNOWN_TVS" ] || return 0
-    grep -Fxv -e "$name" "$KNOWN_TVS" > "$KNOWN_TVS.tmp.$$" || true
-    mv "$KNOWN_TVS.tmp.$$" "$KNOWN_TVS"
+    (
+        flock 9
+        grep -Fxv -e "$name" "$KNOWN_TVS" > "$KNOWN_TVS.tmp.$$" || true
+        mv "$KNOWN_TVS.tmp.$$" "$KNOWN_TVS"
+    ) 9>> "$KNOWN_TVS.lock"
 }
 
 # Terminal rescue when the configured TV is missing but other Samsung
@@ -323,8 +338,10 @@ cmd_pair() {
 # `custom_picker_binary` at our samcast-picker. xdph reads xdph.conf only at
 # portal startup — hence the service restart below, and only when the file
 # content actually changed (the picker itself re-reads the config per cast, so
-# monitor changes never need a restart). Never clobbers a key pointing
-# somewhere else.
+# monitor changes never need a restart). A key pointing at a previous
+# extraction dir's samcast-picker (the dist image rotates on every update —
+# a stale path survives only until the cache is cleared) is ours to reclaim;
+# a genuinely foreign picker is left alone with a warning.
 ensure_picker() {
     local key="screencopy:custom_picker_binary"
     local want="$SCRIPT_DIR/samcast-picker"
@@ -343,11 +360,17 @@ ensure_picker() {
         if [ "$have" = "$want" ]; then
             return 0  # already ours — nothing to do
         fi
-        if [ -n "$have" ]; then
+        if [ -n "$have" ] && [ "${have##*/}" != "samcast-picker" ]; then
             echo "samsung-cast: warning: $conf already sets $key to '$have' — not clobbering it" >&2
             return 0
         fi
-        printf '%s = %s\n' "$key" "$want" >> "$conf"  # someone else's file: append ours
+        # Ours (a stale extraction dir from an earlier image, or an empty
+        # value): rewrite in place — drop the key's lines, re-append. grep -v
+        # + append keeps $want's characters (SCRIPT_DIR could contain odd
+        # ones) out of sed replacement territory entirely.
+        grep -v "^${key}[[:space:]]*=" "$conf" > "$conf.tmp.$$" 2>/dev/null || true
+        printf '%s = %s\n' "$key" "$want" >> "$conf.tmp.$$"
+        mv "$conf.tmp.$$" "$conf"
     else
         mkdir -p "$dir"
         {
@@ -566,7 +589,7 @@ cmd_tv() {
         shift
         [ $# -eq 0 ] || die "unknown argument: $1"
         tv_name_ok "$forgotten" ||
-            die "invalid TV name '$forgotten' ('|', '\"', '\\', '&' and newlines would corrupt the config; spaces are fine)"
+            die "invalid TV name '$forgotten' ('|', '\"', '\$', '\`', '\\', '&' and newlines would corrupt the config; spaces are fine)"
         forget_known_tv "$forgotten"
         if [ "$forgotten" = "$SAMCAST_NAME" ]; then
             echo "forgot '$forgotten' — it is still the configured TV — set another with: samcast tv <NAME>"
@@ -586,7 +609,7 @@ cmd_tv() {
         return
     fi
     tv_name_ok "$name" ||
-        die "invalid TV name '$name' ('|', '\"', '\\', '&' and newlines would corrupt the config; spaces are fine)"
+        die "invalid TV name '$name' ('|', '\"', '\$', '\`', '\\', '&' and newlines would corrupt the config; spaces are fine)"
     # Not on the network right now is not fatal — standby drops the TV's
     # Wi-Fi; allow setting anyway (it may be powered on before the next cast).
     if ! list_tvs_alive | cut -f1 | grep -Fxq -e "$name"; then
@@ -726,10 +749,12 @@ ensure_desktop_entry() {
     onpath="$(command -v samcast 2>/dev/null || true)"
     [ -n "$onpath" ] && [ "$onpath" != "$SCRIPT_DIR/samcast" ] && exec="$onpath"
     local want have
+    # Quote the Exec path: the desktop-entry spec and systemd both parse
+    # double quotes, so a space in the install path stays one argument.
     want="[Desktop Entry]
 Type=Application
 Name=Samsung Cast
-Exec=$exec ui
+Exec=\"$exec\" ui
 Terminal=false
 Categories=Utility;AudioVideo
 Icon=video-display
@@ -858,7 +883,8 @@ cmd_tray() {
             [ "$en" = "enabled" ] || en=disabled
             printf 'unit:    %s\n' "$(systemctl --user is-active "$unit" 2>/dev/null || echo inactive)"
             printf 'enabled: %s\n' "$en"
-            if busctl --user list 2>/dev/null | grep -q "org.kde.StatusNotifierItem"; then
+            if systemctl --user is-active --quiet "$unit" 2>/dev/null &&
+                busctl --user list 2>/dev/null | grep -q "org.kde.StatusNotifierItem"; then
                 echo "icon:    registered on the session bus"
             else
                 echo "icon:    not registered (is a bar with a tray module running?)"
@@ -887,7 +913,7 @@ Description=samsung-cast tray icon
 PartOf=graphical-session.target
 
 [Service]
-ExecStart=$exec tray
+ExecStart=\"$exec\" tray
 Restart=on-failure
 RestartSec=2
 

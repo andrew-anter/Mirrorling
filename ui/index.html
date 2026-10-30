@@ -565,6 +565,7 @@ function render() {
 var tvs = null, monitors = null;      // last fetched rows
 var tvsError = '', monitorsError = '';
 var pickBusy = false;
+var painted = {};                     // last painted signature per list
 
 function markPicks() {
   var curTV = state && state.configured_tv ? state.configured_tv : '';
@@ -576,6 +577,13 @@ function markPicks() {
 function paintPicks(listEl, current, kind) {
   var rows = kind === 'tv' ? tvs : monitors;
   if (!rows) return; // not fetched yet — poll marker pass skipped
+  // render() runs on every 2 s poll: rebuilding the DOM each time drops
+  // keyboard focus and hover mid-interaction — repaint only on real change
+  // (rows or the configured marker).
+  var key = kind === 'tv' ? 'tv' : 'mon';
+  var sig = JSON.stringify(rows) + '\u0000' + current;
+  if (painted[key] === sig) return;
+  painted[key] = sig;
   listEl.textContent = '';
   if (kind === 'monitor') {
     rows = [{ name: 'auto', label: 'Auto — share-picker dialog each cast' }].concat(

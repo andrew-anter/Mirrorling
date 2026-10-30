@@ -7,10 +7,31 @@ import (
 	"log"
 	"os/exec"
 	"strings"
+	"syscall"
 	"time"
 )
 
 const headerTimeout = 5 * time.Second
+
+// newCommand builds a command whose whole process group dies on timeout:
+// samcast is bash and spawns children of its own (doubletake-ctl, systemctl,
+// avahi-browse), so the CommandContext default of killing only the direct
+// child would orphan those grandchildren — a timed-out "samcast on" would
+// leave a live doubletake-ctl connect behind while the caller already got
+// {ok:false, output:"timed out"}. WaitDelay bounds the wait when a killed
+// child's surviving grandchildren still hold the output pipes.
+func newCommand(ctx context.Context, name string, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process != nil {
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+		return nil
+	}
+	cmd.WaitDelay = 2 * time.Second
+	return cmd
+}
 
 // exec runs name with args under a per-call timeout derived from parent ctx.
 //
@@ -22,7 +43,7 @@ func exec_(parent context.Context, timeout time.Duration, name string, args ...s
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, name, args...)
+	cmd := newCommand(ctx, name, args...)
 	cmd.Stdin = nil // null device — never a TTY
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
@@ -59,7 +80,7 @@ func runCombined(parent context.Context, timeout time.Duration, name string, arg
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, name, args...)
+	cmd := newCommand(ctx, name, args...)
 	cmd.Stdin = nil // null device — never a TTY
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
@@ -90,15 +111,18 @@ func runCombined(parent context.Context, timeout time.Duration, name string, arg
 }
 
 // sanitize validates a client-supplied string parameter: non-empty, at most
-// maxLen bytes, no control characters (which covers newlines and would-be
-// config injectors; the rest of the character policy is samcast's own to
-// enforce, and its die message is surfaced to the user).
+// maxLen bytes, no control characters and no shell substitution
+// metacharacters ($, `) — samcast's config is sourced shell, and the UI is
+// the network-facing conduit: it must not pass through to samcast anything
+// that becomes executable if a downstream denylist ever misses. The remaining
+// character policy is samcast's own to enforce, and its die message is
+// surfaced to the user.
 func sanitize(s string, maxLen int) (string, bool) {
 	if s == "" || len(s) > maxLen {
 		return "", false
 	}
 	for _, r := range s {
-		if r < 0x20 || r == 0x7f {
+		if r < 0x20 || r == 0x7f || r == '$' || r == '`' {
 			return "", false
 		}
 	}

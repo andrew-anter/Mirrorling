@@ -2,19 +2,25 @@ BIN := bin
 # The LGPL-3.0 doubletake fork lives in its own repo (sibling clone).
 VENDOR ?= ../doubletake-samsung
 
-# Recursive $(MAKE) goes through `env -u ARGV0`: this machine's make 4.4
+# Nested make invocations go through MAKE_BIN, a literal `make`: make 4.4
 # honors an exported $ARGV0 (set by the ZCode AppImage) as its own program
-# name, which breaks nested invocations.
-.PHONY: all build ui tray app vet install-user clean
+# name — $(MAKE) then expands to the AppImage and nested invocations exec it
+# instead of make, silently skipping the vendor build. The variable is
+# consumed by make itself, so neither $(ARGV0) nor the recipe shell can detect
+# the condition: expand plain `make` from PATH unconditionally (MAKEFLAGS and
+# the jobserver still propagate to it like any sub-make).
+MAKE_BIN := make
+
+.PHONY: all build ui tray app vet clean
 
 all: build
 
 build:
-	env -u ARGV0 $(MAKE) -C $(VENDOR)
+	env -u ARGV0 $(MAKE_BIN) -C $(VENDOR)
 	mkdir -p $(BIN)
 	ln -sf ../$(VENDOR)/bin/doubletake $(BIN)/doubletake
 	ln -sf ../$(VENDOR)/bin/doubletake-ctl $(BIN)/doubletake-ctl
-	env -u ARGV0 $(MAKE) ui tray
+	env -u ARGV0 $(MAKE_BIN) ui tray
 
 # The Go control-panel server (source: ui/, `samcast ui` serves it). ui/ is
 # built by a parallel workstream and may be absent — the directory check keeps
@@ -38,17 +44,22 @@ tray:
 # doubletake/doubletake-ctl, samcast-ui). Explicit-only: `make` still just
 # builds the dev tree.
 app:
-	env -u ARGV0 $(MAKE) -C $(VENDOR) doubletake-release doubletake-ctl-release
-	env -u ARGV0 $(MAKE) ui tray
+	env -u ARGV0 $(MAKE_BIN) -C $(VENDOR) doubletake-release doubletake-ctl-release
+	env -u ARGV0 $(MAKE_BIN) ui tray
+	@test -f $(BIN)/samcast-ui || { echo "make: bin/samcast-ui missing — build the control panel first (check ui/ build output above)"; exit 1; }
+	@test -f $(BIN)/samcast-tray || { echo "make: bin/samcast-tray missing — build the tray helper first (check tray/ build output above)"; exit 1; }
 	rm -rf app/assets && mkdir -p app/assets/bin
+	# re-create the embed anchor FIRST: until the copies land, the anchor is
+	# the only thing keeping `go build` working — and it keeps the ~25 MB of
+	# copied binaries ignored if the build is interrupted mid-target
+	printf '*\n!.gitignore\n' > app/assets/.gitignore
 	cp samcast samcast-picker app/assets/
 	cp $(VENDOR)/doubletake $(VENDOR)/doubletake-ctl app/assets/bin/
 	cp $(BIN)/samcast-ui $(BIN)/samcast-tray app/assets/bin/
-	# re-create the embed anchor (needed when assets/ is empty at commit time)
-	printf '*\n!.gitignore\n' > app/assets/.gitignore
 	cd app && CGO_ENABLED=0 go build -ldflags='-s -w' -o ../dist/samcast .
 
 vet:
+	@cd app && go vet ./...
 	@if [ -d ui ]; then cd ui && go vet ./...; \
 	else echo "make: ui/ missing — nothing to vet"; fi
 	@if [ -d tray ]; then cd tray && go vet ./...; \
@@ -60,4 +71,4 @@ clean:
 	rm -rf app/assets
 	mkdir -p app/assets
 	printf '*\n!.gitignore\n' > app/assets/.gitignore
-	env -u ARGV0 $(MAKE) -C $(VENDOR) clean
+	env -u ARGV0 $(MAKE_BIN) -C $(VENDOR) clean

@@ -34,8 +34,9 @@ Conclusion: AirPlay 2 mirroring via doubletake is the only wireless-desktop path
   NTP on local UDP `N`, audio control `N+1`, audio data `N+2`; `-port-range 60000-60010` pinned here.
 - Audio: receiver's advertised `supportedFormats.screenStream` mask decides ALAC (built-in) vs
   AAC-ELD (needs libfdk-aac build tag). Default build is correct for this TV if it advertises ALAC.
-- Capture: Wayland via `org.freedesktop.portal.ScreenCast` → PipeWire fd; portal restore token is
-  requested and persisted, so the Hyprland picker appears once.
+- Capture: Wayland via `org.freedesktop.portal.ScreenCast` → PipeWire fd. xdg-desktop-portal-hyprland
+  implements no portal `restore_token`s, so samcast installs a headless `custom_picker_binary`
+  (samcast-picker) instead and persists the monitor choice in its own config — see README.
 - Daemon mode (`-daemonize`) runs in the foreground and serves `$XDG_RUNTIME_DIR/doubletake.sock`;
   `samcast start` wraps it in a transient user unit for journal logs.
 

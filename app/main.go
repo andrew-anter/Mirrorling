@@ -23,6 +23,7 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+	"time"
 )
 
 //go:embed all:assets
@@ -92,37 +93,80 @@ func cacheDir() string {
 // extract unpacks the appliance into a sibling temp dir and renames it into
 // place. The rename onto an existing non-empty dir is the concurrent-first-run
 // guard: a rival extraction of the same image wins and ours is discarded.
-func extract(dir, hash string) {
+// Returns an error instead of dying so the deferred tmp cleanup fires on
+// every failure path — os.Exit would skip it and leak the full payload.
+func extract(dir, hash string) error {
 	tmp := filepath.Join(filepath.Dir(dir), fmt.Sprintf("app-%s.tmp-%d", hash, os.Getpid()))
 	defer os.RemoveAll(tmp) // no-op once tmp has been renamed away
+	// A leftover tmp from a killed extractor with this pid must not wedge us.
+	if err := os.RemoveAll(tmp); err != nil {
+		return fmt.Errorf("clearing stale temp dir %s: %v", tmp, err)
+	}
 	if err := os.MkdirAll(tmp, 0o755); err != nil {
-		die("creating %s: %v", tmp, err)
+		return fmt.Errorf("creating %s: %v", tmp, err)
 	}
 	for _, name := range assetList() {
 		data, err := assets.ReadFile(name)
 		if err != nil {
-			die("reading embedded asset %s: %v", name, err)
+			return fmt.Errorf("reading embedded asset %s: %v", name, err)
 		}
 		rel, err := filepath.Rel("assets", name)
 		if err != nil {
-			die("bad asset path %s: %v", name, err)
+			return fmt.Errorf("bad asset path %s: %v", name, err)
 		}
 		dst := filepath.Join(tmp, rel)
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-			die("creating %s: %v", filepath.Dir(dst), err)
+			return fmt.Errorf("creating %s: %v", filepath.Dir(dst), err)
 		}
 		if err := os.WriteFile(dst, data, 0o755); err != nil {
-			die("writing %s: %v", dst, err)
+			return fmt.Errorf("writing %s: %v", dst, err)
 		}
 	}
 	if err := os.WriteFile(filepath.Join(tmp, ".stamp"), []byte(hash), 0o644); err != nil {
-		die("writing stamp: %v", err)
+		return fmt.Errorf("writing stamp: %v", err)
 	}
 	if err := os.Rename(tmp, dir); err != nil {
 		if stamp, rerr := os.ReadFile(filepath.Join(dir, ".stamp")); rerr == nil && string(stamp) == hash {
-			return // concurrent first run of the same image got there first
+			return nil // concurrent first run of the same image got there first
 		}
-		die("extracting to %s: %v", dir, err)
+		// Nothing below replaces an existing dir, so a stale or damaged one
+		// (wrong stamp, half-wiped cache) would fail every later run with a
+		// bare rename error. It is our own hash-keyed cache entry — drop it
+		// and retry once.
+		if rmErr := os.RemoveAll(dir); rmErr != nil {
+			return fmt.Errorf("extracting to %s: %v (stale dir could not be cleared: %v)", dir, err, rmErr)
+		}
+		if err := os.Rename(tmp, dir); err != nil {
+			return fmt.Errorf("extracting to %s: %v", dir, err)
+		}
+	}
+	return nil
+}
+
+// sweepGC prunes abandoned temp dirs from killed extractions and extraction
+// dirs of older images (every rebuilt image gets a fresh hash-keyed copy).
+// Old image dirs go only after a day: a concurrently running older image
+// (a second samcast on PATH, the tray unit) execs from its own dir and must
+// not have it yanked mid-run — and things persisting paths into an extraction
+// dir (daemon unit, tray unit, desktop entry) re-resolve on their next run.
+// Best effort: cache housekeeping is never worth failing the launch over.
+func sweepGC(dir string) {
+	parent := filepath.Dir(dir)
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-24 * time.Hour)
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, "app-") || name == filepath.Base(dir) {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		_ = os.RemoveAll(filepath.Join(parent, name))
 	}
 }
 
@@ -173,8 +217,25 @@ func main() {
 
 	// A valid .stamp short-circuits the extraction on every later run.
 	if stamp, err := os.ReadFile(filepath.Join(dir, ".stamp")); err != nil || string(stamp) != hash {
-		extract(dir, hash)
+		if err := extract(dir, hash); err != nil {
+			die("%v", err)
+		}
 	}
+
+	// A valid .stamp still does not prove the tree intact (a partial cache
+	// wipe or disk damage leaves a correct stamp and no binary — exec would
+	// then die with a bare "no such file" on every later run). Our own keyed
+	// cache entry: drop it and extract fresh.
+	cli := filepath.Join(dir, "samcast")
+	if _, err := os.Stat(cli); err != nil {
+		if err := os.RemoveAll(dir); err != nil {
+			die("clearing damaged extraction dir %s: %v", dir, err)
+		}
+		if err := extract(dir, hash); err != nil {
+			die("%v", err)
+		}
+	}
+	sweepGC(dir)
 
 	args := os.Args[1:]
 	if len(args) == 0 {
@@ -187,7 +248,6 @@ func main() {
 
 	sniff()
 
-	cli := filepath.Join(dir, "samcast")
 	// Exec replaces this process: signals/Ctrl-C behave exactly as under the
 	// plain bash CLI.
 	if err := syscall.Exec(cli, append([]string{cli}, args...), os.Environ()); err != nil {

@@ -82,11 +82,13 @@ monitors can still be pinned — the picker falls back to the GUI while they are
 Mechanics: on the first `samcast start`/`on` (Wayland sessions only), samcast writes
 `screencopy:custom_picker_binary = <repo>/samcast-picker` into `~/.config/hypr/xdph.conf` —
 creating the file if needed and restarting `xdg-desktop-portal-hyprland.service` only when the
-file changed; a key already pointing elsewhere is left alone with a warning. The picker (xdph
-spawns it fresh per cast, so config changes apply immediately) reads `SAMCAST_MONITOR` from
+file changed; a key already pointing elsewhere is left alone with a warning, while a stale entry
+pointing at an old extraction dir of a previous `dist/samcast` image (that dir rotates on every
+rebuild) is reclaimed and repointed at the current picker. The picker (xdph spawns it fresh per
+cast, so config changes apply immediately) reads `SAMCAST_MONITOR` from
 `~/.config/samsung-cast/config`, answers xdph's `[SELECTION]` protocol with `screen:<monitor>`
 (names are Hyprland output names, enforced by xdph; see xdph's `src/shared/ScreencopyShared.cpp`),
-and delegates to `/usr/bin/hyprland-share-picker` when nothing valid is configured.
+and delegates to the system `hyprland-share-picker` from PATH when nothing valid is configured.
 
 On X11 (fallback path in the Go engine) the monitor is chosen by the `DOUBLETAKE_MONITOR` env
 var, which `samcast` passes to the daemon at spawn (`SAMCAST_MONITOR` also feeds it). Because a
@@ -104,11 +106,12 @@ switching TVs means switching that name, and a name is always required (there is
 ./samcast tv             # show the current selection
 ```
 
-Names are free-form (they come straight from the TV's advertisement), but `|`, `"`, `\`, `&` and
-newlines are rejected — they would corrupt the sourced config or the sed rewrite that persists
-them. Setting a name that is currently unreachable still works (standby drops the TV's Wi-Fi):
-samcast warns and pins it for later. A TV only ever needs `./samcast pair` once — pairing
-credentials are per-TV — before `samcast on` can mirror to it.
+Names are free-form (they come straight from the TV's advertisement), but `|`, `"`, `` ` ``, `$`,
+`\`, `&` and newlines are rejected — they would corrupt the sourced config, execute as command
+substitution when it is sourced, or break the sed rewrite that persists them. Setting a name
+that is currently unreachable still works (standby drops the TV's Wi-Fi): samcast warns and pins
+it for later. A TV only ever needs `./samcast pair` once — pairing credentials are per-TV —
+before `samcast on` can mirror to it.
 
 Picked TVs are also remembered in `~/.config/samsung-cast/tvs` (one name per line,
 most-recently-used first): `samcast tvs` keeps listing those names even while their TV is off
@@ -147,7 +150,9 @@ saved/offline TVs stay visible, dimmed, each with a small forget button.
   0. Anything else holding the port (404, non-HTTP, accept-but-silent) fails with
   "port … is in use by something else (try: samcast ui --port N)"; nothing is ever killed.
 - **Localhost-only, no auth:** the server binds `127.0.0.1` and trusts the same user on the same
-  machine — keep it that way (do not expose or port-forward it).
+  machine — keep it that way (do not expose or port-forward it). Requests carrying a non-loopback
+  `Host` header are rejected (DNS-rebinding guard), and state-changing POSTs must send
+  `Content-Type: application/json` (a cross-site form cannot forge that).
 - **PIN pairing happens in-page:** a first-time cast leaves the daemon's connection in a waiting
   state and the panel asks for the PIN the TV shows, submitting it through the same ctl socket
   `samcast` uses.

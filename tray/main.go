@@ -40,13 +40,16 @@ func main() {
 
 	ctl := resolvePath(*ctlFlag, filepath.Join("bin", "doubletake-ctl"))
 	samcastPath := resolvePath(*samcastFlag, "samcast")
-	for label, p := range map[string]string{"samcast": samcastPath, "doubletake-ctl": ctl} {
-		if p == "" {
-			log.Printf("warning: %s path could not be resolved (pass --%s)", label, label)
+	for _, pc := range []struct{ label, flag, path string }{
+		{"samcast", "samcast", samcastPath},
+		{"doubletake-ctl", "ctl", ctl},
+	} {
+		if pc.path == "" {
+			log.Printf("warning: %s path could not be resolved (pass --%s)", pc.label, pc.flag)
 			continue
 		}
-		if fi, err := os.Stat(p); err != nil || fi.IsDir() {
-			log.Printf("warning: %s not found at %s — related actions will fail until the path is fixed", label, p)
+		if fi, err := os.Stat(pc.path); err != nil || fi.IsDir() {
+			log.Printf("warning: %s not found at %s — related actions will fail until the path is fixed", pc.label, pc.path)
 		}
 	}
 	acts := &actions{samcast: samcastPath, samcastOK: samcastPath != "" && isFile(samcastPath)}

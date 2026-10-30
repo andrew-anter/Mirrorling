@@ -36,17 +36,17 @@ type statusReply struct {
 // trayState is the rendered mirroring state; equality (==) drives the
 // change detection that gates signal emission.
 type trayState struct {
-	reachable bool
-	kind      string // daemon state string ("" before the first poll)
-	desc      string // tooltip subtitle
-	color     rgb
-	startOn   bool // menu item 3 enabled
-	stopOn    bool // menu item 4 enabled
+	desc    string // tooltip subtitle
+	color   rgb
+	startOn bool // menu item 3 enabled
+	stopOn  bool // menu item 4 enabled
 }
 
-// stateUnreachable renders a dead/undecipherable daemon: everything disabled.
+// stateUnreachable renders a dead/undecipherable daemon. Start stays enabled:
+// `samcast on` is the cold-start command (it boots the daemon itself), so
+// this is exactly the state where Start must work.
 func stateUnreachable() trayState {
-	return trayState{desc: "Daemon not running", color: colorDark}
+	return trayState{desc: "Daemon not running", color: colorDark, startOn: true}
 }
 
 // renderState maps a status reply to icon + tooltip + menu enablement. An
@@ -59,15 +59,15 @@ func renderState(st statusReply) trayState {
 	}
 	switch st.State {
 	case "discovering":
-		return trayState{reachable: true, kind: st.State, desc: "Discovering TVs…", color: colorAmber}
+		return trayState{desc: "Discovering TVs…", color: colorAmber}
 	case "connecting":
-		return trayState{reachable: true, kind: st.State, desc: "Connecting to " + device + "…", color: colorAmber, stopOn: true}
+		return trayState{desc: "Connecting to " + device + "…", color: colorAmber, stopOn: true}
 	case "pin_required":
-		return trayState{reachable: true, kind: st.State, desc: "Waiting for PIN on " + device, color: colorAmber, stopOn: true}
+		return trayState{desc: "Waiting for PIN on " + device, color: colorAmber, stopOn: true}
 	case "streaming":
-		return trayState{reachable: true, kind: st.State, desc: "Casting to " + device, color: colorGreen, stopOn: true}
+		return trayState{desc: "Casting to " + device, color: colorGreen, stopOn: true}
 	default: // idle and unknown
-		return trayState{reachable: true, kind: st.State, desc: "Idle", color: colorGrey, startOn: true}
+		return trayState{desc: "Idle", color: colorGrey, startOn: true}
 	}
 }
 
