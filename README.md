@@ -19,9 +19,10 @@ lifecycle, config, toggle keybind.
 ## Layout
 
 ```
-samcast              CLI: discover / tvs / tv / pair / start / on / mirror / off / toggle / status / log / ui
+samcast              CLI: discover / tvs / tv / pair / start / on / mirror / off / toggle / status / log / ui / tray
 samcast-picker       headless monitor picker run by xdg-desktop-portal-hyprland per cast (Wayland)
 ui/                  Go control-panel server — served + windowed by `samcast ui` (built to bin/samcast-ui)
+tray/                Go tray-icon helper — StatusNotifierItem in the bar (`samcast tray`, built to bin/samcast-tray)
 Makefile             builds the fork from ../doubletake-samsung (override: make VENDOR=...) + ui/, symlinks bin/
 bin/                 build output symlinks + samcast-ui (not tracked)
 docs/                protocol findings for this TV
@@ -164,11 +165,31 @@ The panel reads the CLI's machine-readable modes (handy in scripts too): `samcas
 nothing is discovered — while `samcast tv --raw` prints the configured TV name and
 `samcast monitor --raw` prints the pinned monitor or `auto`.
 
+## Tray icon
+
+`samcast tray` puts an icon in the bar's tray (waybar hosts the freedesktop StatusNotifierItem
+protocol on Hyprland). It reflects the mirroring state even when the panel window is closed —
+grey idle, amber connecting, green casting, tooltip naming the TV — and clicking it opens the
+panel; the right-click menu has Open control panel / Start mirroring / Stop mirroring / Quit.
+
+```sh
+./samcast tray enable     # install + start ~/.config/systemd/user/samsung-cast-tray.service
+./samcast tray status     # unit state + whether the icon is registered on the bus
+./samcast tray disable    # stop + unenable (icon disappears)
+./samcast tray            # run the helper in the foreground (what the unit calls)
+```
+
+The helper (source in `tray/`, built to `bin/samcast-tray`) speaks StatusNotifierItem + dbusmenu
+directly over the session bus — no tray toolkit, no X11; icons are drawn procedurally, so there
+is no icon-theme dependency. The unit is `Restart=on-failure` and `PartOf=graphical-session.target`:
+crashes come back, a menu-Quit stays quit, logout takes it down. A waybar restart is handled too —
+the helper re-registers with the tray host when it reappears on the bus.
+
 ## Single-file build
 
 `make app` produces `dist/samcast` — ONE static x86-64 executable carrying the whole appliance:
-the `samcast` CLI, `samcast-picker`, the fork's static `doubletake`/`doubletake-ctl`, and the
-control-panel server. Copy it anywhere (`~/.local/bin`, another machine) — no repo checkout
+the `samcast` CLI, `samcast-picker`, the fork's static `doubletake`/`doubletake-ctl`, the
+control-panel server, and the tray helper. Copy it anywhere (`~/.local/bin`, another machine) — no repo checkout
 needed. On first run it unpacks itself to `~/.cache/samsung-cast/app-<hash>` and from then on
 behaves exactly like the `samcast` CLI, except **no arguments means `samcast ui`** (the file IS
 the app, so it opens the control panel):

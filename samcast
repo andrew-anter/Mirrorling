@@ -15,6 +15,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DOUBLETAKE="$SCRIPT_DIR/bin/doubletake"
 CTL="$SCRIPT_DIR/bin/doubletake-ctl"
 UI_BIN="$SCRIPT_DIR/bin/samcast-ui"
+TRAY_BIN="$SCRIPT_DIR/bin/samcast-tray"
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/samsung-cast"
 CONF="$CONF_DIR/config"
 KNOWN_TVS="$CONF_DIR/tvs"  # TVs the user picked at least once (see known_tvs)
@@ -71,6 +72,10 @@ samsung-cast — mirror this desktop to "$SAMCAST_NAME" (Samsung AirPlay 2)
   samcast log [-f]        daemon logs (journalctl)
   samcast ui [--port N] [--no-open|--browser]
                           serve the control panel and open its window
+  samcast tray [enable|disable|status]
+                          tray icon in the bar (waybar/StatusNotifier): shows the
+                          mirroring state and opens the panel even when its
+                          window is closed; enable installs a user service
 
 --raw after tvs/tv/monitors/monitor prints machine-readable output, for the UI.
 
@@ -812,6 +817,92 @@ cmd_ui() {
     fi
 }
 
+# samcast tray — the bar icon (waybar hosts the freedesktop StatusNotifierItem
+# protocol). It reflects the mirroring state and can open the panel or start/
+# stop mirroring even when the panel window is closed. Bare `samcast tray`
+# runs the helper in the FOREGROUND via exec: that is what the systemd unit
+# calls, and exec lets systemd supervise the helper itself rather than a bash
+# wrapper. enable/disable/status manage the unit.
+cmd_tray() {
+    local unit="samsung-cast-tray.service"
+    local sysdir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    local file="$sysdir/$unit"
+    case "${1:-run}" in
+        run)
+            [ -x "$TRAY_BIN" ] || die "tray helper not built — run: make"
+            exec "$TRAY_BIN" --samcast "$SCRIPT_DIR/samcast" --ctl "$CTL"
+            ;;
+        enable)
+            [ -x "$TRAY_BIN" ] || die "tray helper not built — run: make"
+            local before after was_active=0
+            before="$(cat "$file" 2>/dev/null || true)"
+            systemctl --user is-active --quiet "$unit" 2>/dev/null && was_active=1
+            ensure_tray_service
+            after="$(cat "$file" 2>/dev/null || true)"
+            systemctl --user daemon-reload
+            systemctl --user enable --now "$unit"
+            # enable --now leaves a running service untouched; a rewritten unit
+            # (samcast moved on PATH) needs a restart to pick up the new ExecStart
+            if [ "$before" != "$after" ] && [ "$was_active" = 1 ]; then
+                systemctl --user try-restart "$unit"
+            fi
+            echo "samsung-cast: tray is $(systemctl --user is-active "$unit")"
+            ;;
+        disable)
+            systemctl --user disable --now "$unit" 2>/dev/null || true
+            echo "samsung-cast: tray disabled (icon gone until: samcast tray enable)"
+            ;;
+        status)
+            local en
+            en="$(systemctl --user is-enabled "$unit" 2>/dev/null || true)"
+            [ "$en" = "enabled" ] || en=disabled
+            printf 'unit:    %s\n' "$(systemctl --user is-active "$unit" 2>/dev/null || echo inactive)"
+            printf 'enabled: %s\n' "$en"
+            if busctl --user list 2>/dev/null | grep -q "org.kde.StatusNotifierItem"; then
+                echo "icon:    registered on the session bus"
+            else
+                echo "icon:    not registered (is a bar with a tray module running?)"
+            fi
+            ;;
+        *) die "unknown argument: $1 (use: enable, disable, status)" ;;
+    esac
+}
+
+# Install ~/.config/systemd/user/samsung-cast-tray.service. Exec carries the
+# ABSOLUTE samcast path (launchers/systemd do not share this shell's cwd), and
+# prefers a stable samcast on PATH over $SCRIPT_DIR: when this runs from the
+# single-file app, SCRIPT_DIR is the cache extraction dir, which rotates with
+# every image update — the same rule as the desktop entry. PartOf ties the
+# helper to the graphical session; Restart=on-failure restarts crashes but a
+# clean Quit (or logout) stays down.
+ensure_tray_service() {
+    local dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    local file="$dir/samsung-cast-tray.service"
+    local exec="$SCRIPT_DIR/samcast" onpath
+    onpath="$(command -v samcast 2>/dev/null || true)"
+    [ -n "$onpath" ] && [ "$onpath" != "$SCRIPT_DIR/samcast" ] && exec="$onpath"
+    local want have
+    want="[Unit]
+Description=samsung-cast tray icon
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=$exec tray
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target"
+    mkdir -p "$dir"
+    have="$(cat "$file" 2>/dev/null || true)"
+    if [ "$have" = "$want" ]; then
+        return 0
+    fi
+    printf '%s\n' "$want" > "$file"
+    chmod 644 "$file"
+    echo "samsung-cast: wrote $file"
+}
+
 cmd="${1:-}"; shift || true
 case "$cmd" in
     discover) cmd_discover ;;
@@ -831,5 +922,6 @@ case "$cmd" in
     toggle)   cmd_toggle ;;
     log)      cmd_log "$@" ;;
     ui)       cmd_ui "$@" ;;
+    tray)     cmd_tray "$@" ;;
     *)        usage; [ "$cmd" = "" ] || die "unknown command: $cmd" ;;
 esac
