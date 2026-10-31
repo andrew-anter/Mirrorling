@@ -106,11 +106,55 @@ func (m *dbusMenu) AboutToShow(id int32) (bool, *dbus.Error) {
 	return dirty, nil
 }
 
+// AboutToShowGroup is the protocol-v3 batched form of AboutToShow: it reports
+// which of the requested ids changed since the client last fetched, so the
+// client re-fetches those subtrees on menu open.
+func (m *dbusMenu) AboutToShowGroup(ids []int32) ([]int32, *dbus.Error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.dirty || len(ids) == 0 {
+		return []int32{}, nil
+	}
+	m.dirty = false
+	return ids, nil
+}
+
+// menuEvent is one a(isvu) entry of EventGroup.
+type menuEvent struct {
+	ID        int32
+	EventID   string
+	Data      dbus.Variant
+	Timestamp uint32
+}
+
 // Event handles "clicked" on the action items; open/close and other events
 // are ignored. The data variant is protocol noise — its contents don't matter.
+// Version-3 clients (libdbusmenu groups events whenever the server advertises
+// Version >= 3, which we do) go through EventGroup instead; this stays for
+// direct calls and older clients.
 func (m *dbusMenu) Event(id int32, eventId string, data dbus.Variant, timestamp uint32) *dbus.Error {
+	m.handleEvent(id, eventId)
+	return nil
+}
+
+// EventGroup is the protocol-v3 batched form of Event. libdbusmenu sends
+// clicks here with NO fallback to Event when it fails, so omitting it made
+// every menu action (including Quit) silently vanish. It returns the ids
+// whose events could not be processed.
+func (m *dbusMenu) EventGroup(events []menuEvent) ([]int32, *dbus.Error) {
+	var failed []int32
+	for _, ev := range events {
+		if !m.handleEvent(ev.ID, ev.EventID) {
+			failed = append(failed, ev.ID)
+		}
+	}
+	return failed, nil
+}
+
+// handleEvent dispatches one menu event; false means the id is unknown.
+func (m *dbusMenu) handleEvent(id int32, eventId string) bool {
 	if eventId != "clicked" {
-		return nil
+		return true // ignored by design, not a failure
 	}
 	switch id {
 	case itemOpen:
@@ -122,8 +166,10 @@ func (m *dbusMenu) Event(id int32, eventId string, data dbus.Variant, timestamp 
 	case itemQuit:
 		log.Printf("quit requested from tray menu")
 		os.Exit(0)
+	default:
+		return false
 	}
-	return nil
+	return true
 }
 
 // props serves the dbusmenu object's own properties (via Properties.Get);
