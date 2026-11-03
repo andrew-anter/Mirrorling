@@ -37,15 +37,24 @@ func methodOnly(w http.ResponseWriter, r *http.Request, method string) bool {
 	return true
 }
 
+// isJSONContentType reports whether r declares a JSON body. It is the single
+// policy used by both the central POST gate in safe (body-less actions) and
+// decodeBody (endpoints that parse one).
+func isJSONContentType(r *http.Request) bool {
+	mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	return err == nil && mt == "application/json"
+}
+
 // decodeBody reads a small JSON object into dst; a bad body is a 400.
 //
 // The Content-Type must be application/json: the API is unauthenticated, and
 // a cross-site page can POST text/plain bodies (a no-CORS-preflight form or
 // fetch) — accepting any type would hand every endpoint to any webpage the
-// user visits. The panel itself always sends application/json.
+// user visits. The panel itself always sends application/json. safe enforces
+// the same rule for every POST; this repeats it for the handlers that decode
+// a body so they stay correct if they are ever mounted elsewhere.
 func decodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
-	mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
-	if err != nil || mt != "application/json" {
+	if !isJSONContentType(r) {
 		writeJSON(w, http.StatusUnsupportedMediaType, map[string]any{"ok": false, "output": "Content-Type must be application/json"})
 		return false
 	}
@@ -97,14 +106,14 @@ func (s *server) handleState(w http.ResponseWriter, r *http.Request) {
 		resp.Ctl = json.RawMessage(strings.TrimSpace(stdout))
 	}
 
-	if exit, _, _, _ := exec_(ctx, timeoutRaw, "systemctl", "--user", "is-active", "samsung-cast"); exit == 0 {
+	if exit, _, _, _ := exec_(ctx, timeoutRaw, "systemctl", "--user", "is-active", "mirrorling"); exit == 0 {
 		resp.DaemonRunning = true
 	}
 
-	if exit, stdout, _, _ := exec_(ctx, timeoutRaw, s.samcast, "tv", "--raw"); exit == 0 {
+	if exit, stdout, _, _ := exec_(ctx, timeoutRaw, s.mirrorling, "tv", "--raw"); exit == 0 {
 		resp.ConfiguredTV = strings.TrimSpace(stdout)
 	}
-	if exit, stdout, _, _ := exec_(ctx, timeoutRaw, s.samcast, "monitor", "--raw"); exit == 0 {
+	if exit, stdout, _, _ := exec_(ctx, timeoutRaw, s.mirrorling, "monitor", "--raw"); exit == 0 {
 		resp.ConfiguredMonitor = strings.TrimSpace(stdout)
 	}
 
@@ -112,14 +121,14 @@ func (s *server) handleState(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleTVs lists Samsung AirPlay receivers — live ones first, then saved
-// (remembered but currently undiscoverable) ones. `samcast tvs --raw` exits
+// (remembered but currently undiscoverable) ones. `mirrorling tvs --raw` exits
 // non-zero with a stderr message only when NOTHING at all was found — that is
 // the empty state, not a failure.
 func (s *server) handleTVs(w http.ResponseWriter, r *http.Request) {
 	if !methodOnly(w, r, http.MethodGet) {
 		return
 	}
-	exit, stdout, stderr, timedOut := exec_(r.Context(), timeoutList, s.samcast, "tvs", "--raw")
+	exit, stdout, stderr, timedOut := exec_(r.Context(), timeoutList, s.mirrorling, "tvs", "--raw")
 	if timedOut {
 		writeJSON(w, http.StatusOK, map[string]any{"tvs": []tv{}, "error": "timed out"})
 		return
@@ -137,7 +146,7 @@ func (s *server) handleTVs(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		parts := strings.Split(line, "\t")
-		// state rides in the 4th column; an older samcast prints only three
+		// state rides in the 4th column; an older mirrorling prints only three
 		// (it had no saved TVs), so an absent state can only mean "live".
 		state := strings.TrimSpace(col(parts, 3))
 		if state == "" {
@@ -164,7 +173,7 @@ func (s *server) handleMonitors(w http.ResponseWriter, r *http.Request) {
 	if !methodOnly(w, r, http.MethodGet) {
 		return
 	}
-	exit, stdout, stderr, timedOut := exec_(r.Context(), timeoutList, s.samcast, "monitors", "--raw")
+	exit, stdout, stderr, timedOut := exec_(r.Context(), timeoutList, s.mirrorling, "monitors", "--raw")
 	if timedOut {
 		writeJSON(w, http.StatusOK, map[string]any{"monitors": []string{}, "error": "timed out"})
 		return
@@ -185,7 +194,7 @@ func (s *server) handleMonitors(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"monitors": mons})
 }
 
-// handleSetTV persists the chosen TV via `samcast tv <name>`.
+// handleSetTV persists the chosen TV via `mirrorling tv <name>`.
 func (s *server) handleSetTV(w http.ResponseWriter, r *http.Request) {
 	if !methodOnly(w, r, http.MethodPost) {
 		return
@@ -201,12 +210,12 @@ func (s *server) handleSetTV(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "output": "invalid tv name"})
 		return
 	}
-	ok, out := runCombined(r.Context(), timeoutSetter, s.samcast, "tv", name)
+	ok, out := runCombined(r.Context(), timeoutSetter, s.mirrorling, "tv", name)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": ok, "output": out})
 }
 
 // handleForgetTV drops a saved TV from the remembered list via
-// `samcast tv --forget <name>`; the casting config itself stays untouched.
+// `mirrorling tv --forget <name>`; the casting config itself stays untouched.
 func (s *server) handleForgetTV(w http.ResponseWriter, r *http.Request) {
 	if !methodOnly(w, r, http.MethodPost) {
 		return
@@ -222,11 +231,11 @@ func (s *server) handleForgetTV(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "output": "invalid tv name"})
 		return
 	}
-	ok, out := runCombined(r.Context(), timeoutSetter, s.samcast, "tv", "--forget", name)
+	ok, out := runCombined(r.Context(), timeoutSetter, s.mirrorling, "tv", "--forget", name)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": ok, "output": out})
 }
 
-// handleSetMonitor persists the capture monitor via `samcast monitor <name|auto>`.
+// handleSetMonitor persists the capture monitor via `mirrorling monitor <name|auto>`.
 func (s *server) handleSetMonitor(w http.ResponseWriter, r *http.Request) {
 	if !methodOnly(w, r, http.MethodPost) {
 		return
@@ -242,7 +251,7 @@ func (s *server) handleSetMonitor(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "output": "invalid monitor name"})
 		return
 	}
-	ok, out := runCombined(r.Context(), timeoutSetter, s.samcast, "monitor", name)
+	ok, out := runCombined(r.Context(), timeoutSetter, s.mirrorling, "monitor", name)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": ok, "output": out})
 }
 
@@ -250,7 +259,7 @@ func (s *server) handleOn(w http.ResponseWriter, r *http.Request) {
 	if !methodOnly(w, r, http.MethodPost) {
 		return
 	}
-	ok, out := runCombined(r.Context(), timeoutOn, s.samcast, "on")
+	ok, out := runCombined(r.Context(), timeoutOn, s.mirrorling, "on")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": ok, "output": out})
 }
 
@@ -258,7 +267,7 @@ func (s *server) handleOff(w http.ResponseWriter, r *http.Request) {
 	if !methodOnly(w, r, http.MethodPost) {
 		return
 	}
-	ok, out := runCombined(r.Context(), timeoutOff, s.samcast, "off")
+	ok, out := runCombined(r.Context(), timeoutOff, s.mirrorling, "off")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": ok, "output": out})
 }
 
@@ -266,7 +275,7 @@ func (s *server) handleStart(w http.ResponseWriter, r *http.Request) {
 	if !methodOnly(w, r, http.MethodPost) {
 		return
 	}
-	ok, out := runCombined(r.Context(), timeoutStartStop, s.samcast, "start")
+	ok, out := runCombined(r.Context(), timeoutStartStop, s.mirrorling, "start")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": ok, "output": out})
 }
 
@@ -274,7 +283,7 @@ func (s *server) handleStop(w http.ResponseWriter, r *http.Request) {
 	if !methodOnly(w, r, http.MethodPost) {
 		return
 	}
-	ok, out := runCombined(r.Context(), timeoutStartStop, s.samcast, "stop")
+	ok, out := runCombined(r.Context(), timeoutStartStop, s.mirrorling, "stop")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": ok, "output": out})
 }
 
@@ -332,7 +341,7 @@ func (s *server) handleLogs(w http.ResponseWriter, r *http.Request) {
 		lines = 1000
 	}
 	ok, out := runCombined(r.Context(), timeoutLogs,
-		"journalctl", "--user", "-u", "samsung-cast", "-n", strconv.Itoa(lines), "--no-pager", "-o", "cat")
+		"journalctl", "--user", "-u", "mirrorling", "-n", strconv.Itoa(lines), "--no-pager", "-o", "cat")
 	if !ok {
 		writeJSON(w, http.StatusOK, map[string]any{"lines": []string{}, "error": firstNonEmpty(out, "journalctl failed")})
 		return

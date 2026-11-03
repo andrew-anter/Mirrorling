@@ -1,4 +1,4 @@
-module github.com/andrew-anter/samsung-cast/tray
+module github.com/andrew-anter/mirrorling/tray
 
 go 1.22
 

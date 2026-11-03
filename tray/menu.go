@@ -106,17 +106,42 @@ func (m *dbusMenu) AboutToShow(id int32) (bool, *dbus.Error) {
 	return dirty, nil
 }
 
-// AboutToShowGroup is the protocol-v3 batched form of AboutToShow: it reports
-// which of the requested ids changed since the client last fetched, so the
-// client re-fetches those subtrees on menu open.
-func (m *dbusMenu) AboutToShowGroup(ids []int32) ([]int32, *dbus.Error) {
+// AboutToShowGroup is the protocol-v3 batched form of AboutToShow with the
+// wire signature (aiai): updatesNeeded and idErrors. libdbusmenu calls it on
+// menu open and warns/cannot parse a single-array reply, so returning just
+// one array (the old bug) breaks the menu on hosts that use it. Dirty
+// requested ids go in the first array; requested ids that are not ours go in
+// the second; both are empty when nothing changed.
+func (m *dbusMenu) AboutToShowGroup(ids []int32) ([]int32, []int32, *dbus.Error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if !m.dirty || len(ids) == 0 {
-		return []int32{}, nil
+	updates := []int32{}
+	idErrors := []int32{}
+	if !m.dirty {
+		return updates, idErrors, nil
 	}
 	m.dirty = false
-	return ids, nil
+	for _, id := range ids {
+		if isMenuID(id) {
+			updates = append(updates, id)
+		} else {
+			idErrors = append(idErrors, id)
+		}
+	}
+	return updates, idErrors, nil
+}
+
+// isMenuID reports whether id belongs to the fixed tree (the root included).
+func isMenuID(id int32) bool {
+	if id == 0 {
+		return true
+	}
+	for _, known := range menuIds {
+		if id == known {
+			return true
+		}
+	}
+	return false
 }
 
 // menuEvent is one a(isvu) entry of EventGroup.
@@ -215,12 +240,12 @@ func (m *dbusMenu) propsFor(id int32) map[string]dbus.Variant {
 	return p
 }
 
-// enabledOf resolves item enablement. A missing samcast binary disables every
-// samcast-spawning item (Quit must always work); the rest is daemon state.
+// enabledOf resolves item enablement. A missing mirrorling binary disables every
+// mirrorling-spawning item (Quit must always work); the rest is daemon state.
 func (m *dbusMenu) enabledOf(st trayState, id int32) bool {
 	switch id {
 	case itemOpen, itemStart, itemStop:
-		if !m.acts.samcastOK {
+		if !m.acts.mirrorlingOK {
 			return false
 		}
 	}

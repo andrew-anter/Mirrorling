@@ -28,9 +28,26 @@ const (
 )
 
 // statusReply is the part of `doubletake-ctl status` the tray renders.
+// StatePINRequired covers both an on-screen PIN and a configured receiver
+// password; CredentialKind/NeedsCredential tell which prompt is actually
+// pending (older daemons send neither, so PIN remains the default).
 type statusReply struct {
-	State  string `json:"state"`
-	Device string `json:"device"`
+	State           string `json:"state"`
+	Device          string `json:"device"`
+	NeedsCredential bool   `json:"needs_credential"`
+	CredentialKind  string `json:"credential_kind"`
+}
+
+// credentialPassword is the CredentialKind a receiver that requires a
+// configured password reports; every other kind (pin, empty, unknown) keeps
+// the PIN wording.
+const credentialPassword = "password"
+
+// passwordPending reports whether the waiting credential is a configured
+// password rather than the on-screen PIN. NeedsCredential gates the kind so a
+// status reply with no credential metadata keeps the legacy PIN prompt.
+func (st statusReply) passwordPending() bool {
+	return st.NeedsCredential && st.CredentialKind == credentialPassword
 }
 
 // trayState is the rendered mirroring state; equality (==) drives the
@@ -43,7 +60,7 @@ type trayState struct {
 }
 
 // stateUnreachable renders a dead/undecipherable daemon. Start stays enabled:
-// `samcast on` is the cold-start command (it boots the daemon itself), so
+// `mirrorling on` is the cold-start command (it boots the daemon itself), so
 // this is exactly the state where Start must work.
 func stateUnreachable() trayState {
 	return trayState{desc: "Daemon not running", color: colorDark, startOn: true}
@@ -63,6 +80,9 @@ func renderState(st statusReply) trayState {
 	case "connecting":
 		return trayState{desc: "Connecting to " + device + "…", color: colorAmber, stopOn: true}
 	case "pin_required":
+		if st.passwordPending() {
+			return trayState{desc: "Waiting for password on " + device, color: colorAmber, stopOn: true}
+		}
 		return trayState{desc: "Waiting for PIN on " + device, color: colorAmber, stopOn: true}
 	case "streaming":
 		return trayState{desc: "Casting to " + device, color: colorGreen, stopOn: true}
@@ -167,8 +187,10 @@ type trayServer struct {
 	loggedFail bool // first failure of a failure streak logged once
 }
 
-// export registers the item, menu and properties interfaces. godbus serves
-// Introspectable itself.
+// export registers the item, menu and properties interfaces. libdbusmenu and
+// SNI hosts address the fixed interfaces directly and never introspect, which
+// matters because godbus does not merge its Introspectable stub onto exported
+// paths (Introspect there answers UnknownInterface).
 func (t *trayServer) export() error {
 	props := &propsStore{providers: map[string]func() map[string]dbus.Variant{
 		sniIface:  t.sniProps,
@@ -199,7 +221,7 @@ func (t *trayServer) sniProps() map[string]dbus.Variant {
 	return map[string]dbus.Variant{
 		"Category":            dbus.MakeVariant("ApplicationStatus"),
 		"Id":                  dbus.MakeVariant(t.id),
-		"Title":               dbus.MakeVariant("Samsung Cast"),
+		"Title":               dbus.MakeVariant("Mirrorling"),
 		"Status":              dbus.MakeVariant("Active"),
 		"WindowId":            dbus.MakeVariant(int32(0)),
 		"IconName":            dbus.MakeVariant(""),
@@ -209,7 +231,7 @@ func (t *trayServer) sniProps() map[string]dbus.Variant {
 		"IconPixmap":          dbus.MakeVariant(pix),
 		"OverlayIconPixmap":   dbus.MakeVariant([]pixmap{}),
 		"AttentionIconPixmap": dbus.MakeVariant([]pixmap{}),
-		"ToolTip":             dbus.MakeVariant(toolTip{Title: "Samsung Cast", Desc: st.desc, Pixmaps: pix}),
+		"ToolTip":             dbus.MakeVariant(toolTip{Title: "Mirrorling", Desc: st.desc, Pixmaps: pix}),
 		"Menu":                dbus.MakeVariant(menuPath),
 		"ItemIsMenu":          dbus.MakeVariant(false),
 	}

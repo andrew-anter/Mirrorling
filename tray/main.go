@@ -1,16 +1,16 @@
-// Command samcast-tray is the samsung-cast tray helper: one StatusNotifierItem
+// Command mirrorling-tray is the mirrorling tray helper: one StatusNotifierItem
 // icon in the waybar/freedesktop tray whose pixmap and tooltip mirror the
 // mirroring state, with a menu to open the control panel and start/stop
 // mirroring while the panel window is closed.
 //
-// Started by `samcast tray` (samsung-cast-tray.service) and polls
+// Started by `mirrorling tray` (mirrorling-tray.service) and polls
 // doubletake-ctl every --interval to keep icon and menu current.
 //
 // SECURITY MODEL: the item exposes only start/stop mirroring plus an
 // open-panel action, and only on the local session bus — the same
-// loopback-style trust as samcast-ui: anything that can reach us on the
+// loopback-style trust as mirrorling-ui: anything that can reach us on the
 // session bus already runs as this user, which is exactly what the panel and
-// the samcast CLI would allow anyway. No config rewrite or log access is
+// the mirrorling CLI would allow anyway. No config rewrite or log access is
 // exposed through the tray.
 package main
 
@@ -33,15 +33,37 @@ func main() {
 	log.SetFlags(log.Ltime)
 
 	ctlFlag := flag.String("ctl", "", "path to doubletake-ctl (default: <dir of executable>/../bin/doubletake-ctl)")
-	samcastFlag := flag.String("samcast", "", "path to the samcast CLI (default: <dir of executable>/../samcast)")
+	mirrorlingFlag := flag.String("mirrorling", "", "path to the mirrorling CLI (default: <dir of executable>/../mirrorling)")
 	interval := flag.Duration("interval", 2*time.Second, "state poll interval")
-	id := flag.String("id", "samcast", "tray item id")
+	id := flag.String("id", "mirrorling", "tray item id")
 	flag.Parse()
 
+	if err := checkInterval(*interval); err != nil {
+		log.Fatalf("%v", err)
+	}
+
+	conn, err := dbus.SessionBus()
+	if err != nil {
+		log.Fatalf("cannot connect to the session bus: %v", err)
+	}
+	// A fixed bus name is the single-instance lock: two helpers (manual run,
+	// restart race) must never draw two icons. DoNotQueue makes the loser fail
+	// immediately instead of queueing for a name it can never own, and a loser
+	// is not an error worth a restart, so it exits 0.
+	busName := sniBusPrefix + "-mirrorling"
+	reply, err := conn.RequestName(busName, dbus.NameFlagDoNotQueue)
+	if err != nil {
+		log.Fatalf("cannot request %s: %v", busName, err)
+	}
+	if reply != dbus.RequestNameReplyPrimaryOwner {
+		log.Printf("%s already owned — another tray is running, exiting", busName)
+		return
+	}
+
 	ctl := resolvePath(*ctlFlag, filepath.Join("bin", "doubletake-ctl"))
-	samcastPath := resolvePath(*samcastFlag, "samcast")
+	mirrorlingPath := resolvePath(*mirrorlingFlag, "mirrorling")
 	for _, pc := range []struct{ label, flag, path string }{
-		{"samcast", "samcast", samcastPath},
+		{"mirrorling", "mirrorling", mirrorlingPath},
 		{"doubletake-ctl", "ctl", ctl},
 	} {
 		if pc.path == "" {
@@ -52,21 +74,9 @@ func main() {
 			log.Printf("warning: %s not found at %s — related actions will fail until the path is fixed", pc.label, pc.path)
 		}
 	}
-	acts := &actions{samcast: samcastPath, samcastOK: samcastPath != "" && isFile(samcastPath)}
-	if !acts.samcastOK {
-		log.Printf("samcast missing — tray actions disabled (Quit still works)")
-	}
-
-	conn, err := dbus.SessionBus()
-	if err != nil {
-		log.Fatalf("cannot connect to the session bus: %v", err)
-	}
-	// RequestNameReplaceExisting: a just-killed previous instance keeps the
-	// name until the bus notices, and restart races are normal.
-	// RequestNameDoNotQueue: fail fast rather than queue behind someone else.
-	busName := fmt.Sprintf("%s-%d-1", sniBusPrefix, os.Getpid())
-	if _, err := conn.RequestName(busName, dbus.NameFlagReplaceExisting|dbus.NameFlagDoNotQueue); err != nil {
-		log.Fatalf("cannot request %s: %v", busName, err)
+	acts := &actions{mirrorling: mirrorlingPath, mirrorlingOK: mirrorlingPath != "" && isFile(mirrorlingPath)}
+	if !acts.mirrorlingOK {
+		log.Printf("mirrorling missing — tray actions disabled (Quit still works)")
 	}
 
 	state := &stateStore{}
@@ -131,8 +141,18 @@ func pollLoop(ctl string, interval time.Duration, srv *trayServer) {
 	}
 }
 
+// checkInterval rejects non-positive poll intervals before any ticker exists:
+// time.NewTicker panics on those, and a crash loop under systemd is worse than
+// one clear startup error.
+func checkInterval(d time.Duration) error {
+	if d <= 0 {
+		return fmt.Errorf("--interval must be greater than zero, got %s", d)
+	}
+	return nil
+}
+
 // resolvePath returns flagPath when set, otherwise flagPath resolved relative
-// to the executable: <exe dir>/../<rel>. Same layout rule as samcast-ui.
+// to the executable: <exe dir>/../<rel>. Same layout rule as mirrorling-ui.
 func resolvePath(flagPath, rel string) string {
 	if flagPath != "" {
 		return flagPath
@@ -149,27 +169,36 @@ func isFile(p string) bool {
 	return err == nil && !fi.IsDir()
 }
 
-// actions runs samcast subcommands detached from the tray.
+// actions runs mirrorling subcommands detached from the tray.
 type actions struct {
-	samcast   string
-	samcastOK bool
+	mirrorling   string
+	mirrorlingOK bool
 }
 
 func (a *actions) run(args ...string) {
-	if !a.samcastOK {
-		log.Printf("cannot run samcast %s: binary missing", strings.Join(args, " "))
+	if !a.mirrorlingOK {
+		log.Printf("cannot run mirrorling %s: binary missing", strings.Join(args, " "))
 		return
 	}
-	// Detached: stdin is the null device and output is discarded, so samcast's
-	// TTY-guarded prompts can never fire and nothing outlives the tray's stdio.
-	cmd := exec.Command(a.samcast, args...)
+	// Detached: stdin is the null device so mirrorling's TTY-guarded prompts can
+	// never fire. stdout/stderr are wired to the helper's stderr (the journal),
+	// so a failing action — a first-run `mirrorling on` above all — is visible
+	// instead of vanishing with the inherited nil stdio.
+	cmd := exec.Command(a.mirrorling, args...)
 	cmd.Stdin = nil
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
-		log.Printf("samcast %s: %v", strings.Join(args, " "), err)
+		log.Printf("mirrorling %s: %v", strings.Join(args, " "), err)
 		return
 	}
-	// Wait off-thread so exited children don't linger as zombies.
-	go func() { _ = cmd.Wait() }()
+	// Wait off-thread so exited children don't linger as zombies, and log any
+	// non-zero exit against the action that asked for it.
+	go func() {
+		if err := cmd.Wait(); err != nil {
+			log.Printf("mirrorling %s failed: %v", strings.Join(args, " "), err)
+		}
+	}()
 }
 
 func (a *actions) open()  { a.run("ui") }

@@ -1,0 +1,1170 @@
+#!/usr/bin/env bash
+# Mirrorling: wireless desktop mirroring from this laptop to a Samsung
+# AirPlay 2 (Tizen) TV via the doubletake-samsung fork.
+#
+# Config: ~/.config/mirrorling/config (sourced shell, written on first run)
+# Saved TVs: ~/.config/mirrorling/tvs (one name per line, MRU first)
+# Logs:   journalctl --user -u mirrorling
+#
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 Mirrorling contributors.
+# Bundled doubletake/doubletake-ctl binaries are LGPL-3.0-or-later and run as
+# separate processes (see README); this script itself is MIT.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DOUBLETAKE="$SCRIPT_DIR/bin/doubletake"
+CTL="$SCRIPT_DIR/bin/doubletake-ctl"
+UI_BIN="$SCRIPT_DIR/bin/mirrorling-ui"
+TRAY_BIN="$SCRIPT_DIR/bin/mirrorling-tray"
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/mirrorling"
+CONF="$CONF_DIR/config"
+KNOWN_TVS="$CONF_DIR/tvs"  # TVs the user picked at least once (see known_tvs)
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+SOCK="$RUNTIME_DIR/doubletake.sock"
+UNIT="mirrorling"
+
+# First run: write a config with working defaults. No TV is hardcoded — pick
+# one with `mirrorling tv` after `mirrorling tvs` lists what is on the LAN. Every
+# assignment is ${VAR:-default}, so an environment override needs no edit.
+if [ ! -f "$CONF" ]; then
+    mkdir -p "$CONF_DIR"
+    cat > "$CONF" <<'EOF'
+# mirrorling configuration (sourced by mirrorling)
+# mDNS service name of the TV (see: mirrorling tvs / mirrorling tv). Empty = not selected yet.
+MIRRORLING_NAME=""
+MIRRORLING_FPS="${MIRRORLING_FPS:-60}"          # capture frame rate (30 saves Wi-Fi bandwidth)
+MIRRORLING_HWACCEL="${MIRRORLING_HWACCEL:-auto}"    # auto | vaapi | nvenc | openh264 | none
+MIRRORLING_PORT_RANGE="${MIRRORLING_PORT_RANGE:-60000-60010}"
+MIRRORLING_TIMING="${MIRRORLING_TIMING:-NTP}"     # NTP | PTP — some Samsung models advertise PTP but omit ClockID in SETUP (upstream #30)
+MIRRORLING_EXTRA_FLAGS="${MIRRORLING_EXTRA_FLAGS:-}"  # extra doubletake flags, e.g. "-bitrate 4500 -no-audio"
+MIRRORLING_MONITOR="${MIRRORLING_MONITOR:-}"      # monitor to cast ("" = picker dialog per cast; see: mirrorling monitor / mirrorling monitors)
+EOF
+    echo "mirrorling: wrote default config to $CONF" >&2
+fi
+
+# Documented contract: environment variables override the config file. The
+# generated template honors that by construction; this snapshot makes it true
+# for hand-written configs too. ${VAR+x} is the only unset-safe presence test
+# under `set -u`; ${!_var+x} works the same through an indirect name.
+declare -A _env_override=()
+for _key in NAME FPS HWACCEL PORT_RANGE TIMING EXTRA_FLAGS MONITOR; do
+    _var="MIRRORLING_$_key"
+    if [ -n "${!_var+x}" ]; then _env_override["$_key"]="${!_var}"; fi
+done
+unset _key _var
+# shellcheck source=/dev/null
+source "$CONF"
+for _key in NAME FPS HWACCEL PORT_RANGE TIMING EXTRA_FLAGS MONITOR; do
+    if [ -n "${_env_override[$_key]+x}" ]; then
+        printf -v "MIRRORLING_$_key" '%s' "${_env_override[$_key]}"
+    fi
+done
+unset _key _env_override
+
+# Defaults appended after sourcing cover configs written before a key existed
+# (source under `set -u` would otherwise die with "unbound variable"). An
+# empty name means no TV has been selected yet — never a guessed default.
+MIRRORLING_NAME="${MIRRORLING_NAME:-}"
+MIRRORLING_FPS="${MIRRORLING_FPS:-60}"
+MIRRORLING_HWACCEL="${MIRRORLING_HWACCEL:-auto}"
+MIRRORLING_PORT_RANGE="${MIRRORLING_PORT_RANGE:-60000-60010}"
+MIRRORLING_TIMING="${MIRRORLING_TIMING:-NTP}"
+MIRRORLING_EXTRA_FLAGS="${MIRRORLING_EXTRA_FLAGS:-}"
+MIRRORLING_MONITOR="${MIRRORLING_MONITOR:-}"
+
+# Samsung Tizen advertises PTP but its SETUP omits timingPeerInfo.ClockID —
+# force NTP unless overridden (upstream doubletake issue #30, Finding 3).
+export DOUBLETAKE_TIMING="$MIRRORLING_TIMING"
+
+usage() {
+    local tv="${MIRRORLING_NAME:-a Samsung TV}"
+    cat <<EOF
+Mirrorling — mirror this desktop to $tv (AirPlay 2)
+
+  mirrorling discover        list Samsung AirPlay receivers on the LAN
+  mirrorling target          print resolved TV IP
+  mirrorling pair            first-time pairing (PIN appears on the TV)
+  mirrorling start           start the background daemon (systemd-run --user)
+  mirrorling stop            stop the daemon
+  mirrorling status          daemon + stream status
+  mirrorling on [PIN]        start mirroring (same as: mirrorling mirror)
+  mirrorling mirror [PIN]    mirror the current screen to the TV
+  mirrorling off             stop mirroring
+  mirrorling toggle          mirror on <-> off (bind this to a key)
+  mirrorling devices         devices the daemon can see
+  mirrorling monitors        list connectable monitors (Hyprland outputs / X11 screens)
+  mirrorling monitor [NAME|auto]
+                          show or set the monitor to cast (auto = picker dialog per cast)
+  mirrorling tvs             list Samsung TVs seen on the LAN or saved earlier (the configured one is marked)
+  mirrorling tv [NAME|--forget NAME]
+                          show, set, or forget the TV to cast (a name is always required; no auto)
+  mirrorling log [-f]        daemon logs (journalctl)
+  mirrorling ui [--port N] [--no-open|--browser]
+                          serve the control panel and open its window
+  mirrorling tray [enable|disable|status]
+                          tray icon in the bar (waybar/StatusNotifier): shows the
+                          mirroring state and opens the panel even when its
+                          window is closed; enable installs a user service
+  mirrorling version         print the version
+  mirrorling help            this help
+
+--raw after tvs/tv/monitors/monitor prints machine-readable output, for the UI.
+
+Env overrides after config: MIRRORLING_NAME, MIRRORLING_FPS, MIRRORLING_HWACCEL,
+MIRRORLING_PORT_RANGE, MIRRORLING_TIMING, MIRRORLING_EXTRA_FLAGS, MIRRORLING_MONITOR.
+EOF
+}
+
+die() { echo "mirrorling: $*" >&2; exit 1; }
+
+# Commands that take no argument reject one instead of silently ignoring it: a
+# typo (or a misplaced --raw) should be visible, not a no-op.
+no_extra_args() {
+    [ "$#" -eq 0 ] || die "unexpected argument: $1"
+}
+
+# Persist KEY="VALUE" in $CONF: sed-replace the existing line, append when the
+# key is missing (configs written before a feature predate its variable).
+# Callers validate VALUE (monitor names are ^[A-Za-z0-9_-]+$ or empty, TV
+# names via tv_name_ok), so no sed metacharacters can sneak in.
+# flock-serialized: sed -i is a read-modify-write over the whole file, and
+# mirrorling instances race each other (UI poll, tray action, keybind toggle) —
+# without the lock a concurrent writer's key change is silently dropped.
+set_config_var() {
+    local key="$1" value="$2"
+    (
+        flock 9
+        if grep -q "^${key}=" "$CONF"; then
+            sed -i "s|^${key}=.*|${key}=\"${value}\"|" "$CONF"
+        else
+            # A hand-edited config may lack a final newline; without this the
+            # appended assignment would be glued onto the last line.
+            if [ -s "$CONF" ] && [ -n "$(tail -c 1 "$CONF")" ]; then
+                printf '\n' >> "$CONF"
+            fi
+            printf '%s="%s"\n' "$key" "$value" >> "$CONF"
+        fi
+    ) 9>> "$CONF.lock"
+}
+
+# TV names are free-form mDNS service names: spaces are legitimate ("Living
+# Room TV") and parsed in full by scan_tvs/match_target. They still land
+# inside a sed replacement and a quoted line of sourced shell: '|' breaks the
+# sed delimiter, '"' breaks the quoting, '\' and '&' are sed replacement
+# metacharacters, '$' and '`' would execute as command substitution when the
+# config is sourced on every mirrorling run, and newlines, tabs or any other
+# control character would inject or corrupt a config line. Exactly that set is
+# refused — spaces are not.
+tv_name_ok() {
+    case "$1" in
+        *'|'*|*'"'*|*'\'*|*'&'*|*'$'*|*'`'*) return 1 ;;
+        *[[:cntrl:]]*) return 1 ;;
+    esac
+    return 0
+}
+
+# Capture-capable monitor names, one per line, on stdout. Wayland/Hyprland is
+# the primary target (names are Hyprland outputs; hyprctl missing/failing
+# there is terminal — no xrandr guesswork); xrandr covers the X11 fallback.
+# Neither session → print nothing, caller decides. The space in `/ connected/`
+# keeps xrandr's "disconnected" from matching.
+list_monitors() {
+    if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+        hyprctl monitors 2>/dev/null | awk '$1=="Monitor"{print $2}' || true
+    elif [ -n "${DISPLAY:-}" ]; then
+        xrandr --query 2>/dev/null | awk '/ connected/ {print $1}' || true
+    fi
+}
+
+# One parse of the same avahi-browse invocation match_target uses: one line
+# per receiver as name<TAB>ip<TAB>port<TAB>model<TAB>fw (fw may be empty when
+# the TV omits fv=; port feeds tv_alive's reachability probe). The service
+# name is read in full from the header — spaces are part of it ("Living Room
+# TV"), so the fourth whitespace field must not be used. IPv4 blocks only:
+# avahi emits a separate IPv6 block for the same service, and letting its
+# link-local address overwrite the IPv4 one would defeat tv_alive's TCP probe.
+# Listing order is avahi's (unordered), as discover always printed.
+scan_tvs() {
+    avahi-browse -rt _airplay._tcp -t 2>/dev/null | awk '
+        # Header: "= <iface> IPv4 <full name> _airplay._tcp local". Strip the
+        # prefix through the protocol token and the " _airplay._tcp <domain>"
+        # suffix; proto records whether this block is IPv4 (4) or not (0).
+        function header_name(line,   s) {
+            s = line
+            sub(/^=[[:space:]]+[^[:space:]]+[[:space:]]+/, "", s)
+            proto = (s ~ /^IPv4[[:space:]]/) ? 4 : 0
+            sub(/^[^[:space:]]+[[:space:]]+/, "", s)
+            sub(/[[:space:]]+_airplay\._tcp[[:space:]].*$/, "", s)
+            return s
+        }
+        $1 == "=" { name = header_name($0); is4 = proto; next }
+        name == "" || !is4 { next }
+        /address =/ {
+            gsub(/[][]/, ""); sub(/^.*address = /, "")
+            if ($0 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) addr[name] = $0
+            next
+        }
+        /port =/    { gsub(/[][]/, ""); sub(/^.*port = /, "");    port[name] = $0; next }
+        match($0, /model=[^"]+/) { model[name] = substr($0, RSTART + 6, RLENGTH - 6) }
+        match($0, /fv=[^"]+/)    { fw[name]    = substr($0, RSTART + 3, RLENGTH - 3) }
+        END {
+            # Samsung consumer model prefixes: U (UAU/UE/UN, ...) and Q
+            # (QLED QN/QA, ...). Other vendor model strings are dropped.
+            for (n in addr)
+                if (model[n] ~ /^[UQ]/)
+                    printf "%s\t%s\t%s\t%s\t%s\n", n, addr[n], port[n], model[n], fw[n]
+        }' || true
+}
+
+# A stale avahi record outlives the TV: standby drops its Wi-Fi but avahi
+# keeps the cached service until the record's TTL lapses, so "advertised" is
+# no proof the TV is there. Live therefore means advertised AND connectable:
+# a sub-second TCP connect to the advertised AirPlay port (Samsung picks it
+# dynamically, so it must come from the record). 1s absorbs unroutable
+# addresses; a real TV on the LAN answers in LAN latency, so the common path
+# costs almost nothing.
+tv_alive() {
+    local ip="$1" port="$2"
+    [ -n "$ip" ] && [ -n "$port" ] || return 1
+    timeout 1 bash -c 'exec 3<>/dev/tcp/$1/$2' _ "$ip" "$port" 2>/dev/null
+}
+
+# scan_tvs rows are five TAB fields (name ip port model fw); this reduces
+# live rows to the three the callers contract for (name ip model). Reading
+# four here used to fold fw into model, so every live TV looked saved.
+# The rescue prompt must not offer a dead TV, and `tvs` must not report a
+# powered-off one as live (a stale record then just falls through to the saved
+# list). Sequential on purpose — typically one or two TVs, and alive ones
+# answer immediately. return 0 because the loop's status is its last body
+# command: a dead TV at EOF would otherwise fail the function (set -e).
+list_tvs_alive() {
+    local name ip port model fw
+    while IFS=$'\t' read -r name ip port model fw; do
+        [ -n "$name" ] || continue
+        if tv_alive "$ip" "$port"; then
+            printf '%s\n' "$name"$'\t'"$ip"$'\t'"$model"
+        fi
+    done < <(scan_tvs)
+    return 0
+}
+
+# Saved TVs: every name the user ever picked, so `tvs` can keep it listed
+# (greyed, offline) after standby drops the TV from the network. One name per
+# line, most-recently-used first; tv_name_ok refuses newlines, so
+# line-per-name cannot break, and a missing file is just an empty list.
+known_tvs() {
+    cat "$KNOWN_TVS" 2>/dev/null || true
+}
+
+# Prepend NAME, dropping any earlier occurrence (MRU-first). temp+mv in
+# $CONF_DIR keeps an interrupted write from truncating the list; flock keeps a
+# concurrent save (UI pick vs terminal rescue prompt) from dropping one of the
+# two names (both rewrite the whole list).
+save_known_tv() {
+    local name="$1"
+    mkdir -p "$CONF_DIR"
+    (
+        flock 9
+        {
+            printf '%s\n' "$name"
+            grep -Fxv -e "$name" "$KNOWN_TVS" 2>/dev/null || true
+        } > "$KNOWN_TVS.tmp.$$"
+        mv "$KNOWN_TVS.tmp.$$" "$KNOWN_TVS"
+    ) 9>> "$KNOWN_TVS.lock"
+}
+
+# Drop every exact-line match for NAME; forgetting a name that is not saved
+# is a no-op, not an error. Same lock as save_known_tv: both rewrite the list.
+forget_known_tv() {
+    local name="$1"
+    [ -f "$KNOWN_TVS" ] || return 0
+    (
+        flock 9
+        grep -Fxv -e "$name" "$KNOWN_TVS" > "$KNOWN_TVS.tmp.$$" || true
+        mv "$KNOWN_TVS.tmp.$$" "$KNOWN_TVS"
+    ) 9>> "$KNOWN_TVS.lock"
+}
+
+# Terminal rescue when the configured TV is missing but other Samsung
+# receivers are in sight: list them numbered and persist an explicit pick.
+# No default: an empty/invalid answer must NOT cast to whichever other room's
+# TV happens to be up — it returns 1 so the caller dies with its usual
+# message. Everything goes to stderr: resolve_target's callers (cmd_target)
+# print values on stdout. Caller checks the TTY — keybindings never see this.
+select_tv() {
+    local rows name ip model count=0 pick chosen
+    local -a opts=()
+    rows="$(list_tvs_alive)"
+    [ -n "$rows" ] || return 1
+    echo "'$MIRRORLING_NAME' not found on the network — other Samsung receivers in sight:" >&2
+    while IFS=$'\t' read -r name ip model; do
+        [ -n "$name" ] || continue
+        opts+=("$name"$'\t'"$ip"$'\t'"$model")
+        count=$((count + 1))
+        printf '  [%d] %s  %s  model=%s\n' "$count" "$name" "$ip" "$model" >&2
+    done <<<"$rows"
+    [ "$count" -gt 0 ] || return 1
+    if ! read -r -p "Cast to: " pick; then
+        return 1  # stdin closed mid-prompt — keep the configured TV
+    fi
+    if [ "$pick" -eq "$pick" ] 2>/dev/null && [ "$pick" -ge 1 ] && [ "$pick" -le "$count" ]; then
+        chosen="${opts[$((pick - 1))]}"
+    else
+        echo "mirrorling: '$pick' is not a menu option" >&2
+        return 1
+    fi
+    IFS=$'\t' read -r name ip model <<<"$chosen"
+    tv_name_ok "$name" || return 1  # hostile mDNS name — refuse, caller dies below
+    set_config_var MIRRORLING_NAME "$name"
+    MIRRORLING_NAME="$name"
+    save_known_tv "$name"
+    echo "will cast '$name' — run 'mirrorling pair' before the first cast to this TV" >&2
+}
+
+# The resolve_target matcher, factored so the post-pick re-resolve can reuse
+# it: prints "ip port" when NAME is advertising on AirPlay, nothing otherwise.
+# || true so a missing avahi-browse degrades to "not found" (clear die) rather
+# than a set -e pipeline error.
+# Every service block starts with a "=" header line, so the header re-matches
+# grab each time: a partial record for NAME (address but no port) must resolve
+# to nothing — NOT bleed into the next service's lines and "resolve" NAME to
+# another TV's ip:port. The header is parsed in full (names may contain
+# spaces) and only IPv4 blocks are eligible: avahi emits an additional IPv6
+# block whose link-local address would otherwise win, and tv_alive cannot
+# probe it.
+match_target() {
+    local name="$1" out
+    out="$(avahi-browse -rt _airplay._tcp -t 2>/dev/null | awk -v n="$name" '
+        function header_name(line,   s) {
+            s = line
+            sub(/^=[[:space:]]+[^[:space:]]+[[:space:]]+/, "", s)
+            proto = (s ~ /^IPv4[[:space:]]/) ? 4 : 0
+            sub(/^[^[:space:]]+[[:space:]]+/, "", s)
+            sub(/[[:space:]]+_airplay\._tcp[[:space:]].*$/, "", s)
+            return s
+        }
+        $1 == "=" { hname = header_name($0); grab = (proto == 4 && hname == n); ip = ""; port = ""; next }
+        grab && /address =/ { gsub(/[][]/, ""); sub(/^.*address = /, ""); ip = $0 }
+        grab && /port =/    { gsub(/[][]/, ""); sub(/^.*port = /, "");    port = $0 }
+        grab && ip != "" && port != "" { print ip, port; exit }')" || true
+    [ -n "$out" ] || return 0
+    # The record can outlive the TV (stale cache). A dead endpoint must read
+    # as "not found" so the caller prompts or dies with the friendly message
+    # instead of hanging while the stream dials a ghost.
+    if tv_alive "${out% *}" "${out#* }"; then
+        printf '%s\n' "$out"
+    fi
+}
+
+# Resolve the TV's IP + AirPlay port from mDNS (avahi). TV must be powered on.
+# Sets TARGET_IP and TARGET_PORT (Samsung picks a dynamic AirPlay port, e.g. 51820, not 7000).
+#
+# Rescue prompt fires ONLY when the configured TV is missing — never while it
+# resolves (switching between two live TVs is `mirrorling tv`'s job) — and only
+# on a TTY; keybindings/scripts keep the plain die. A picked name is
+# re-resolved exactly once below: if it fails too, control falls to the die
+# (with the new name) instead of looping.
+resolve_target() {
+    local out
+    [ -n "${MIRRORLING_NAME:-}" ] ||
+        die "no TV selected — run 'mirrorling tvs' to list Samsung TVs, then 'mirrorling tv <exact name>'"
+    out="$(match_target "$MIRRORLING_NAME")"
+    if [ -z "$out" ] && [ -t 0 ] && select_tv; then
+        out="$(match_target "$MIRRORLING_NAME")"
+    fi
+    [ -n "$out" ] || die "'$MIRRORLING_NAME' not found on the network (is the TV on and on Wi-Fi?)"
+    TARGET_IP="${out% *}"; TARGET_PORT="${out#* }"
+}
+
+stream_flags() {
+    printf -- '-fps %s -hwaccel %s -port-range %s %s' \
+        "$MIRRORLING_FPS" "$MIRRORLING_HWACCEL" "$MIRRORLING_PORT_RANGE" "$MIRRORLING_EXTRA_FLAGS"
+}
+
+cmd_discover() {
+    local rows name ip port model fw
+    echo "Samsung AirPlay receivers on this network:"
+    rows="$(scan_tvs)"
+    while IFS=$'\t' read -r name ip port model fw; do
+        [ -n "$name" ] || continue  # empty scan -> one empty herestring line
+        # scan_tvs applied the /^[UQ]/ Samsung filter; this keeps discover's
+        # historical columns (fw prints empty when the TV omits fv=). Raw
+        # mDNS view: no liveness probing here, `mirrorling tvs` is the
+        # can-I-cast view.
+        printf '  %-10s %-15s model=%-10s fw=%s\n' "$name" "$ip" "$model" "$fw"
+    done <<<"$rows"
+}
+
+cmd_target() { resolve_target; echo "$TARGET_IP:$TARGET_PORT"; }
+
+cmd_pair() {
+    resolve_target
+    echo "Pairing with $MIRRORLING_NAME ($TARGET_IP:$TARGET_PORT). Check the TV for the PIN."
+    # shellcheck disable=SC2086
+    exec "$DOUBLETAKE" -target "$TARGET_IP" -port "$TARGET_PORT" -pair $(stream_flags)
+}
+
+# Keep xdg-desktop-portal-hyprland casting headlessly: point its
+# `custom_picker_binary` at our mirrorling-picker. xdph reads xdph.conf only at
+# portal startup — hence the service restart below, and only when the file
+# content actually changed (the picker itself re-reads the config per cast, so
+# monitor changes never need a restart). A key pointing at a previous
+# extraction dir's mirrorling-picker (the dist image rotates on every update —
+# a stale path survives only until the cache is cleared) is ours to reclaim;
+# a genuinely foreign picker is left alone with a warning.
+ensure_picker() {
+    local key="screencopy:custom_picker_binary"
+    local want="$SCRIPT_DIR/mirrorling-picker"
+    local dir="${XDG_CONFIG_HOME:-$HOME/.config}/hypr"
+    local conf="$dir/xdph.conf" have=""
+
+    # Only a real Hyprland session runs xdph. WAYLAND_DISPLAY is also set by
+    # Sway/GNOME, whose portals have no xdph.conf; hyprctl is the reliable
+    # probe — missing or failing means there is no xdph to configure.
+    command -v hyprctl >/dev/null 2>&1 || return 0
+    hyprctl monitors >/dev/null 2>&1 || return 0
+    [ -x "$want" ] || {
+        echo "mirrorling: warning: $want missing or not executable — leaving $conf alone" >&2
+        return 0
+    }
+
+    if [ -f "$conf" ]; then
+        if [ ! -w "$conf" ]; then
+            echo "mirrorling: warning: $conf is not writable — casting continues with xdph's stock picker" >&2
+            return 0
+        fi
+        have="$(grep -m1 "^${key}[[:space:]]*=" "$conf" 2>/dev/null |
+            sed 's/^[^=]*=[[:space:]]*//;s/[[:space:]]*$//' || true)"
+        if [ "$have" = "$want" ]; then
+            return 0  # already ours — nothing to do
+        fi
+        if [ -n "$have" ] && [ "${have##*/}" != "mirrorling-picker" ]; then
+            echo "mirrorling: warning: $conf already sets $key to '$have' — not clobbering it" >&2
+            return 0
+        fi
+        # Ours (a stale extraction dir from an earlier image, or an empty
+        # value): rewrite in place — write the new key first, then the old
+        # file minus that key. printf+grep keeps $want's characters (SCRIPT_DIR
+        # could contain odd ones) out of sed replacement territory entirely.
+        # Both redirects are silenced before they can fail: bash reports a
+        # failed redirection to the stderr it had BEFORE that redirect was
+        # processed (a trailing 2>/dev/null cannot catch it), and when the
+        # failing redirect belongs to the group itself bash reports the
+        # group's status as 0 — a read-only $dir would then be reported as
+        # installed and the portal restarted for nothing. The inner redirect
+        # keeps the failure visible in the status.
+        local tmp="$conf.tmp.$$"
+        if ! {
+            printf '%s = %s\n' "$key" "$want" 2>/dev/null > "$tmp" &&
+                { grep -v "^${key}[[:space:]]*=" "$conf" >> "$tmp" 2>/dev/null || true; } &&
+                mv "$tmp" "$conf" 2>/dev/null
+        }; then
+            rm -f "$tmp" 2>/dev/null || true
+            echo "mirrorling: warning: cannot write $conf — casting continues with xdph's stock picker" >&2
+            return 0
+        fi
+    else
+        if ! mkdir -p "$dir" 2>/dev/null; then
+            echo "mirrorling: warning: cannot create $dir — casting continues with xdph's stock picker" >&2
+            return 0
+        fi
+        if ! {
+            printf '%s\n%s = %s\n' \
+                "# mirrorling manages the ${key} key below (headless cast picker; see: mirrorling monitor)" \
+                "$key" "$want" > "$conf"
+        } 2>/dev/null; then
+            echo "mirrorling: warning: cannot write $conf — casting continues with xdph's stock picker" >&2
+            return 0
+        fi
+    fi
+    echo "mirrorling: set $key in $conf — restarting xdg-desktop-portal-hyprland.service"
+    systemctl --user restart xdg-desktop-portal-hyprland.service 2>/dev/null ||
+        echo "mirrorling: warning: restarting xdg-desktop-portal-hyprland.service failed — log out/in or restart it" >&2
+}
+
+# First-cast terminal prompt: with several monitors connected and none
+# configured, ask once and persist the answer, so later casts (and the xdph
+# picker) stay dialog-free. No-op when not a terminal, ≤1 monitor, or already
+# configured — keybinding-safe.
+select_monitor() {
+    if [ -n "$MIRRORLING_MONITOR" ] || [ ! -t 0 ]; then
+        return 0
+    fi
+    local names name count=0 i=1 pick chosen
+    local -a opts=()
+    names="$(list_monitors)"
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        opts+=("$name")
+        count=$((count + 1))
+    done <<<"$names"
+    if [ "$count" -lt 2 ]; then
+        return 0
+    fi
+    echo "More than one monitor connected — pick the one to cast:"
+    for name in "${opts[@]}"; do
+        printf '  [%d] %s\n' "$i" "$name"
+        i=$((i + 1))
+    done
+    if ! read -r -p "Monitor to cast [1]: " pick; then
+        return 0  # stdin closed mid-prompt — stay on auto
+    fi
+    [ -n "$pick" ] || pick=1  # empty answer takes the default
+    if [ "$pick" -eq "$pick" ] 2>/dev/null && [ "$pick" -ge 1 ] && [ "$pick" -le "$count" ]; then
+        chosen="${opts[$((pick - 1))]}"
+    else
+        echo "mirrorling: '$pick' is not a menu option — keeping auto" >&2
+        return 0
+    fi
+    # The choice comes from this list, but it still becomes a sourced config
+    # line and an xdph [SELECTION] answer: re-check both the characters and
+    # that the monitor is still in the list seen a moment ago.
+    case "$chosen" in
+        *[!A-Za-z0-9_-]*)
+            echo "mirrorling: '$chosen' is not a valid monitor name — keeping auto" >&2
+            return 0
+            ;;
+    esac
+    if ! printf '%s\n' "${opts[@]}" | grep -Fxq -e "$chosen"; then
+        echo "mirrorling: '$chosen' is no longer connected — keeping auto" >&2
+        return 0
+    fi
+    set_config_var MIRRORLING_MONITOR "$chosen"
+    MIRRORLING_MONITOR="$chosen"
+    echo "will cast '$chosen' (change: mirrorling monitor <NAME>; revert: mirrorling monitor auto)"
+}
+
+cmd_start() {
+    ensure_picker
+    if systemctl --user is-active --quiet "$UNIT"; then
+        echo "daemon already running"
+    else
+        # A crashed transient unit stays loaded in "failed" state, and
+        # systemd-run refuses to reuse the name until it is reset. Harmless
+        # when the unit is unknown; never fatal.
+        systemctl --user reset-failed "$UNIT" 2>/dev/null || true
+        # A socket left behind by a crashed daemon makes the new daemon exit
+        # instantly on bind. The unit is inactive here, so if the daemon does
+        # not answer on the socket it is stale and ours to remove.
+        if [ -S "$SOCK" ] && ! timeout 2 "$CTL" status >/dev/null 2>&1; then
+            rm -f -- "$SOCK"
+        fi
+        # DOUBLETAKE_MONITOR pins the X11 capture monitor (Go-engine contract);
+        # Wayland ignores it — its selection is xdph's picker. The daemon env
+        # is fixed at spawn, so pass it only when set.
+        local -a envs=(--setenv="DOUBLETAKE_TIMING=$DOUBLETAKE_TIMING")
+        if [ -n "$MIRRORLING_MONITOR" ]; then
+            envs+=(--setenv="DOUBLETAKE_MONITOR=$MIRRORLING_MONITOR")
+        fi
+        # Capture systemd-run's stderr: under `set -e` a bare failure would
+        # dump its raw message and exit, hiding the actionable hint. --collect
+        # makes the transient unit (and its failure state) disappear with it.
+        local start_err=""
+        if ! start_err="$(systemd-run --user --unit="$UNIT" --collect "${envs[@]}" \
+            --description="mirrorling AirPlay mirroring daemon" \
+            "$DOUBLETAKE" -daemonize -port-range "$MIRRORLING_PORT_RANGE" \
+            -fps "$MIRRORLING_FPS" -hwaccel "$MIRRORLING_HWACCEL" $MIRRORLING_EXTRA_FLAGS 2>&1)"; then
+            die "could not start the daemon: ${start_err:-systemd-run failed} (check: journalctl --user -u $UNIT)"
+        fi
+    fi
+    for _ in $(seq 1 40); do [ -S "$SOCK" ] && break; sleep 0.25; done
+    [ -S "$SOCK" ] || die "daemon socket $SOCK never appeared (journalctl --user -u $UNIT)"
+    "$CTL" status
+}
+
+cmd_stop()   {
+    "$CTL" disconnect 2>/dev/null || true
+    systemctl --user stop "$UNIT" 2>/dev/null || true
+    echo "stopped"
+}
+cmd_status() { "$CTL" status 2>/dev/null || die "daemon not running (mirrorling start)"; }
+cmd_devices(){ "$CTL" devices 2>/dev/null || die "daemon not running (mirrorling start)"; }
+
+cmd_monitors() {
+    # --raw (UI contract): names only, one per line — sole argument only.
+    local raw=""
+    if [ "${1:-}" = "--raw" ]; then raw=1; shift; fi
+    [ $# -eq 0 ] || die "unknown argument: $1"
+    local names name i=0 suffix
+    names="$(list_monitors)"
+    [ -n "$names" ] || die "no monitors found (Wayland needs hyprctl + a Hyprland session; X11 needs xrandr + DISPLAY)"
+    if [ -n "$raw" ]; then
+        printf '%s\n' "$names"
+        return
+    fi
+    echo "Monitors:"
+    while IFS= read -r name; do
+        i=$((i + 1))
+        suffix=""
+        if [ "$name" = "$MIRRORLING_MONITOR" ]; then suffix=" (configured)"; fi
+        printf '  [%d] %s%s\n' "$i" "$name" "$suffix"
+    done <<<"$names"
+}
+
+# mirrorling monitor — show or persist which monitor to cast (MIRRORLING_MONITOR).
+cmd_monitor() {
+    # --raw (UI contract): the configured name, or "auto" spelled out — sole argument only.
+    if [ "${1:-}" = "--raw" ]; then
+        shift
+        [ $# -eq 0 ] || die "unknown argument: $1"
+        echo "${MIRRORLING_MONITOR:-auto}"
+        return
+    fi
+    local name="${1:-}"
+    [ $# -le 1 ] || die "unexpected argument: $2"
+    if [ -z "$name" ]; then
+        if [ -n "$MIRRORLING_MONITOR" ]; then
+            echo "$MIRRORLING_MONITOR"
+        else
+            echo "auto (choose in the portal dialog)"
+        fi
+        echo "set with: mirrorling monitor <NAME> (mirrorling monitors lists them; mirrorling monitor auto reverts)"
+        return
+    fi
+    if [ "$name" = "auto" ]; then
+        set_config_var MIRRORLING_MONITOR ""
+        MIRRORLING_MONITOR=""
+        echo "monitor selection: auto — the share-picker dialog shows on each cast"
+        return
+    fi
+    # Output names (eDP-1, DP-1, HDMI-A-1...) are [A-Za-z0-9_-]; anything else
+    # would corrupt the sourced config line or the xdph [SELECTION] answer.
+    case "$name" in
+        *[!A-Za-z0-9_-]*) die "invalid monitor name '$name' (letters, digits, '-' and '_' only, e.g. eDP-1)" ;;
+    esac
+    # Not currently connected is not fatal — allow setting anyway (the monitor
+    # may be undocked now but docked again before the next cast; xdph's picker
+    # falls back to the GUI until then).
+    if ! list_monitors | grep -Fxq -e "$name"; then
+        echo "mirrorling: note: '$name' is not connected right now — set anyway (it may be docked again before the next cast)" >&2
+    fi
+    set_config_var MIRRORLING_MONITOR "$name"
+    MIRRORLING_MONITOR="$name"
+    echo "will cast monitor '$name' ('mirrorling monitor auto' reverts; 'mirrorling monitors' lists)"
+}
+
+# mirrorling tvs — the LAN, numbered like cmd_monitors, configured TV marked,
+# merged with the saved list: TVs picked earlier stay listed (greyed in the
+# UI) when standby dropped them, so they can be re-pinned or forgotten.
+cmd_tvs() {
+    # --raw (UI contract): name<TAB>ip<TAB>model<TAB>state per row — state is
+    # "live" or "saved", and saved rows leave ip/model empty (two tabs). No
+    # header or hint — sole argument only. Dies only when the MERGED list
+    # (live + saved + configured) is entirely empty: a TV-less LAN with a
+    # configured TV still has something to show.
+    local raw=""
+    if [ "${1:-}" = "--raw" ]; then raw=1; shift; fi
+    [ $# -eq 0 ] || die "unknown argument: $1"
+    local rows known combined="" live="" name ip model state i=0 suffix
+    rows="$(list_tvs_alive)"  # a stale advertised record reports as saved, not live
+    known="$(known_tvs)"
+    [ -n "$rows" ] || [ -n "$known" ] || [ -n "${MIRRORLING_NAME:-}" ] ||
+        die "no Samsung TVs discovered (is a TV powered on? standby drops its Wi-Fi)"
+    while IFS=$'\t' read -r name ip model; do
+        [ -n "$name" ] || continue  # empty scan -> one empty herestring line
+        combined+="$name"$'\t'"$ip"$'\t'"$model"$'\t'"live"$'\n'
+        live+="$name"$'\n'
+    done <<<"$rows"
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        if printf '%s' "$live" | grep -Fxq -e "$name"; then continue; fi
+        combined+="$name"$'\t\t\tsaved'$'\n'
+    done <<<"$known"
+    # The configured name backfills when it is neither live nor saved (a
+    # config predating the saved list, say) — it must never go invisible.
+    if [ -n "${MIRRORLING_NAME:-}" ] &&
+        ! printf '%s' "$live" | grep -Fxq -e "$MIRRORLING_NAME" &&
+        ! printf '%s' "$known" | grep -Fxq -e "$MIRRORLING_NAME"; then
+        combined+="$MIRRORLING_NAME"$'\t\t\tsaved'$'\n'
+    fi
+    if [ -n "$raw" ]; then
+        printf '%s' "$combined"
+        return
+    fi
+    echo "TVs:"
+    while IFS=$'\t' read -r name ip model state; do
+        [ -n "$name" ] || continue
+        i=$((i + 1))
+        suffix=""
+        if [ "$name" = "$MIRRORLING_NAME" ]; then suffix=" (configured)"; fi
+        if [ "$state" = "live" ]; then
+            printf '  [%d] %s  %s  model=%s%s\n' "$i" "$name" "$ip" "$model" "$suffix"
+        else
+            printf '  [%d] %s  saved — not on the network%s\n' "$i" "$name" "$suffix"
+        fi
+    done <<<"$combined"
+    echo "set with: mirrorling tv <NAME>"
+}
+
+# mirrorling tv — show or persist which TV to cast (MIRRORLING_NAME). The mDNS
+# service name IS the TV identity the config carries; unlike monitors there is
+# no auto — a name is always required (no per-cast picker exists for TVs).
+# --forget NAME drops a name from the saved list only; MIRRORLING_NAME stands.
+cmd_tv() {
+    # --raw (UI contract): the bare name, exit 0 always (no "(none)" placeholder,
+    # no discovery round-trip) — sole argument only.
+    if [ "${1:-}" = "--raw" ]; then
+        shift
+        [ $# -eq 0 ] || die "unknown argument: $1"
+        echo "$MIRRORLING_NAME"
+        return
+    fi
+    # --forget consumes the NEXT argument as the name and only edits the saved
+    # list — the casting config (MIRRORLING_NAME) is deliberately left intact.
+    if [ "${1:-}" = "--forget" ]; then
+        shift
+        [ $# -ge 1 ] || die "tv --forget needs a name ('mirrorling tvs' lists the saved ones)"
+        local forgotten="$1"
+        shift
+        [ $# -eq 0 ] || die "unknown argument: $1"
+        tv_name_ok "$forgotten" ||
+            die "invalid TV name '$forgotten' ('|', '\"', '\$', '\`', '\\', '&' and control characters would corrupt the config; spaces are fine)"
+        forget_known_tv "$forgotten"
+        if [ "$forgotten" = "$MIRRORLING_NAME" ]; then
+            echo "forgot '$forgotten' — it is still the configured TV — set another with: mirrorling tv <NAME>"
+        else
+            echo "forgot '$forgotten'"
+        fi
+        return
+    fi
+    local name="${1:-}"
+    [ $# -le 1 ] || die "unexpected argument: $2"
+    if [ -z "$name" ]; then
+        if [ -n "$MIRRORLING_NAME" ]; then
+            echo "$MIRRORLING_NAME"
+        else
+            echo "(none)"
+        fi
+        echo "set with: mirrorling tv <NAME> (mirrorling tvs lists them)"
+        return
+    fi
+    tv_name_ok "$name" ||
+        die "invalid TV name '$name' ('|', '\"', '\$', '\`', '\\', '&' and control characters would corrupt the config; spaces are fine)"
+    # Not on the network right now is not fatal — standby drops the TV's
+    # Wi-Fi; allow setting anyway (it may be powered on before the next cast).
+    if ! list_tvs_alive | cut -f1 | grep -Fxq -e "$name"; then
+        echo "mirrorling: note: '$name' is not on the network right now — set anyway (run 'mirrorling tvs' once it is powered on)" >&2
+    fi
+    set_config_var MIRRORLING_NAME "$name"
+    MIRRORLING_NAME="$name"
+    # select_tv's rescue prompt saves too — both sites exist so ANY path that
+    # pins a TV remembers it, and tvs keeps it listed once it goes offline.
+    save_known_tv "$name"
+    echo "will cast '$name' ('mirrorling pair' is needed the first time this TV is used; 'mirrorling tvs' lists)"
+}
+
+cmd_on() {
+    local pin="${1:-}"
+    resolve_target
+    ensure_picker  # Wayland: keep xdph pointed at mirrorling-picker (idempotent)
+    # Picking once here (first interactive cast with >1 monitor, nothing
+    # configured) makes every later cast dialog-free: xdph re-runs its picker
+    # per request and the stored choice short-circuits it.
+    select_monitor
+
+    if systemctl --user is-active --quiet "$UNIT"; then
+        # The daemon's env is fixed at spawn. If its recorded DOUBLETAKE_MONITOR
+        # (the X11 capture monitor — Wayland ignores it) drifted from the
+        # current choice, restart so the change takes effect. Desired value is
+        # absent when MIRRORLING_MONITOR is empty (auto).
+        local want="${MIRRORLING_MONITOR:-}" have=""
+        have="$(systemctl --user show "$UNIT" -p Environment 2>/dev/null |
+            sed -n 's/^Environment=//p' | tr ' ' '\n' |
+            sed -n 's/^DOUBLETAKE_MONITOR=//p' || true)"
+        if [ "$have" != "$want" ]; then
+            echo "mirrorling: capture monitor changed (${have:-auto} -> ${want:-auto}) — restarting the daemon"
+            "$CTL" disconnect 2>/dev/null || true
+            systemctl --user stop "$UNIT" 2>/dev/null || true
+            cmd_start
+        fi
+    else
+        cmd_start >/dev/null
+    fi
+    # The daemon resolves the AirPlay port from its own mDNS cache; wait until
+    # the TV shows up there (a freshly started daemon needs a few seconds).
+    local _
+    for _ in $(seq 1 40); do
+        "$CTL" devices 2>/dev/null | grep -Fq "$TARGET_IP" && break
+        sleep 0.5
+    done
+    echo "Mirroring to $MIRRORLING_NAME ($TARGET_IP:$TARGET_PORT)..."
+    if [ -n "$pin" ]; then "$CTL" connect "$TARGET_IP" "$pin"; else "$CTL" connect "$TARGET_IP"; fi
+}
+
+cmd_off()   {
+    "$CTL" disconnect 2>/dev/null || true
+    echo "mirroring stopped"
+}
+
+cmd_toggle() {
+    # A keybound toggle must be able to turn OFF even when mDNS/avahi is
+    # broken or the configured TV changed: an active stream short-circuits
+    # before resolve_target, so nothing network-dependent runs. Only an idle
+    # daemon needs the resolution and the start path.
+    local st="" state=""
+    st="$("$CTL" status 2>/dev/null || true)"
+    # Only the JSON "state" value decides: the whole status blob may carry
+    # error text mentioning "connecting", and matching that would turn a
+    # keybound ON into a disconnect. Pretty (multi-line) and compact JSON both
+    # work — the pattern is per line, and only the first "state" field counts.
+    state="$(printf '%s\n' "$st" |
+        sed -n 's/.*"state"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+    case "$state" in
+        streaming|connecting|pin_required)
+            cmd_off
+            return
+            ;;
+    esac
+    resolve_target
+    cmd_on
+}
+
+cmd_log() { journalctl --user -u "$UNIT" "$@"; }
+
+# One GET /api/health against 127.0.0.1:$1 via bash's /dev/tcp (no curl
+# dependency). Prints the peer's first response line (e.g. "HTTP/1.0 200 OK")
+# and returns 0 when something answered; 1 when the connection was refused
+# (nothing listening); 2 when the port accepted but sent nothing for 5s — an
+# open port that is not talking HTTP must NOT look like a free port, or a
+# second server would just crash-bind on it. The read timeout keeps a hung
+# listener from stalling the launch.
+ui_health_status() {
+    local port="$1" line=""
+    # bash prints /dev/tcp failures before a trailing 2>/dev/null applies
+    # (redirections are processed left-to-right), so the silencing is scoped to
+    # this group; the fd 3 it opens persists past the closing brace.
+    { exec 3<>"/dev/tcp/127.0.0.1/$port"; } 2>/dev/null || return 1
+    # The Host header is required: the server's hostGuard rejects a request
+    # without it (403), which would make every --no-open/--browser launch look
+    # like a foreign listener on the port.
+    printf 'GET /api/health HTTP/1.0\r\nHost: 127.0.0.1:%s\r\n\r\n' "$port" >&3 2>/dev/null || true
+    IFS= read -r -u 3 -t 5 line || true
+    exec 3>&-
+    [ -n "$line" ] || return 2
+    printf '%s\n' "$line"
+}
+
+# Status line -> HTTP code ("HTTP/1.0 200 OK" -> 200); anything non-HTTP or
+# empty becomes something that is never "200", so callers can just compare.
+ui_health_code() {
+    local status="${1%%$'\r'}"
+    status="${status#* }"   # drop "HTTP/1.x"
+    status="${status%% *}"  # keep the code word only
+    printf '%s\n' "$status"
+}
+
+# The Wails panel links GTK3/WebKit2GTK dynamically. Without them exec dies
+# with the loader's "error while loading shared libraries: ...", which reads
+# like a broken install; check up front and die with the package hint. A
+# static or non-ELF binary prints "not a dynamic executable" and passes.
+ui_preflight() {
+    local out missing
+    command -v ldd >/dev/null 2>&1 || return 0
+    out="$(ldd "$UI_BIN" 2>&1 || true)"
+    missing="$(printf '%s\n' "$out" | awk '/not found/ {print $1}' | sort -u | tr '\n' ' ')"
+    [ -n "$missing" ] || return 0
+    die "mirrorling-ui is missing shared libraries: ${missing% } — install GTK3 and WebKit2GTK 4.1 (Arch: gtk3 webkit2gtk-4.1; Debian 13+ / Ubuntu 24.04+: libgtk-3-0t64 libwebkit2gtk-4.1-0; Debian 12 bookworm: libgtk-3-0; see README: Dependencies)"
+}
+
+# --browser: hand the URL to the desktop default handler. The default app
+# window is not opened here at all: cmd_ui execs the UI binary with --window
+# and it hosts the panel in its own native WebKitGTK window (Wails) — no
+# chromium/firefox involved.
+ui_open_browser_tab() {
+    local url="$1"
+    setsid xdg-open "$url" </dev/null >/dev/null 2>&1 &
+}
+
+# Desktop entry so wofi/rofi/app-grids list "Mirrorling". Exec carries the
+# ABSOLUTE mirrorling path: launchers do not share this shell's cwd. Idempotent —
+# rewritten only when missing or differing (differing content is updated: this
+# file is ours to own); byte-identical content means no rewrite churn, which
+# launchers watching directory mtimes appreciate. Icon=video-display is a
+# freedesktop-standard name, always resolvable. Only the file written here is
+# ever chmodded.
+ensure_desktop_entry() {
+    local dir="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+    local file="$dir/mirrorling.desktop"
+    # Prefer a stable launcher on PATH over $SCRIPT_DIR: when this runs from
+    # the single-file app, SCRIPT_DIR is the cache extraction dir, which
+    # rotates with every image update and can be wiped — an entry pointing
+    # there breaks until a terminal run re-extracts. ~/.local/bin/mirrorling
+    # re-extracts itself, so the entry survives both.
+    local exec="$SCRIPT_DIR/mirrorling" onpath
+    onpath="$(command -v mirrorling 2>/dev/null || true)"
+    [ -n "$onpath" ] && [ "$onpath" != "$SCRIPT_DIR/mirrorling" ] && exec="$onpath"
+    local want have
+    # Quote the Exec path: the desktop-entry spec and systemd both parse
+    # double quotes, so a space in the install path stays one argument.
+    want="[Desktop Entry]
+Type=Application
+Name=Mirrorling
+Exec=\"$exec\" ui
+Terminal=false
+Categories=Utility;AudioVideo
+Icon=video-display
+StartupWMClass=mirrorling"
+    mkdir -p "$dir"
+    have="$(cat "$file" 2>/dev/null || true)"
+    if [ "$have" = "$want" ]; then
+        return 0
+    fi
+    printf '%s\n' "$want" > "$file"
+    chmod 644 "$file"
+    echo "mirrorling: wrote $file"
+}
+
+# mirrorling ui — serve the control panel (bin/mirrorling-ui, built by make) and
+# open its window. The server binds 127.0.0.1 only: no auth, same-user
+# same-machine trust. An instance already listening is reused after a 200 on
+# /api/health; a port answering anything else belongs to someone else —
+# refused with a port hint, never killed.
+cmd_ui() {
+    local port=8791 open=app   # open: app window | browser tab | none (--no-open)
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --port)
+                [ $# -ge 2 ] || die "--port needs a number"
+                case "$2" in ''|*[!0-9]*) die "--port wants a number, got '$2'" ;; esac
+                # Length-check before any arithmetic: bash wraps $((10#N))
+                # modulo 2^64, so 18446744073709560407 would silently become
+                # 8791. Leading zeros are legal input, so strip them first.
+                local pdigits="${2#"${2%%[!0]*}"}"
+                if [ "${#pdigits}" -gt 5 ]; then
+                    die "--port must be between 1 and 65535, got '$2'"
+                fi
+                port=$((10#${pdigits:-0}))
+                if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+                    die "--port must be between 1 and 65535, got '$2'"
+                fi
+                shift
+                ;;
+            --no-open) open=none ;;
+            --browser) open=browser ;;
+            *) die "unknown argument: $1" ;;
+        esac
+        shift
+    done
+    local url="http://127.0.0.1:$port"
+
+    [ -x "$UI_BIN" ] || die "UI server not built — run: make"
+    ui_preflight
+    ensure_desktop_entry
+
+    # Native app window (Wails/WebKitGTK): the UI binary owns the probe itself
+    # — 200 on /api/health attaches a second window to the running server
+    # (launcher, tray, a rerun), a free port is bound with the server living
+    # inside the window process, anything else on the port fails with the same
+    # "in use by something else" message. Foreground exec: window close and
+    # Ctrl-C both take the server down with the shell (a reused server is not
+    # ours — attach mode leaves it running on the other process).
+    #
+    # No DISPLAY and no WAYLAND_DISPLAY means there is no window system to
+    # host the native window: --window would exit 1. Fall through to the
+    # headless server path instead (same as --no-open), so SSH/headless runs
+    # still get a usable panel on the printed URL.
+    if [ "$open" = app ]; then
+        if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
+            echo "mirrorling: no graphical session (DISPLAY/WAYLAND_DISPLAY unset) — serving the panel headless instead of opening a window" >&2
+            open=none
+        else
+            echo "mirrorling UI: $url"
+            exec "$UI_BIN" --window --mirrorling "$SCRIPT_DIR/mirrorling" --ctl "$CTL" --addr "127.0.0.1:$port"
+        fi
+    fi
+
+    # Reuse probe BEFORE starting (headless paths only): 200 on /api/health
+    # means a server of ours is already up — just point the browser at it.
+    # Refused = free port, start one below. Any other answer, or a
+    # port that accepts without speaking HTTP, is something else: die rather
+    # than kill it or stack a second server on top.
+    local status="" rc=0 ui_pid=""
+    status="$(ui_health_status "$port")" || rc=$?
+    if [ "$rc" -eq 0 ] && [ "$(ui_health_code "$status")" != "200" ]; then
+        die "port $port is in use by something else (try: mirrorling ui --port N)"
+    elif [ "$rc" -eq 2 ]; then
+        die "port $port is in use by something else (try: mirrorling ui --port N)"
+    fi
+
+    if [ "$rc" -ne 0 ]; then  # refused — free port, ours to claim
+        echo "mirrorling: starting UI server on $url"
+        # Not exec: the window may only open once /api/health answers, and
+        # wait below keeps Ctrl-C killing both this script and the server.
+        "$UI_BIN" --mirrorling "$SCRIPT_DIR/mirrorling" --ctl "$CTL" --addr "127.0.0.1:$port" &
+        ui_pid=$!
+        # Global on purpose: the EXIT trap outlives cmd_ui's locals, where
+        # $ui_pid is already out of scope (`set -u` would abort the trap and
+        # leak the server). ${UI_PID:-} keeps that scope quiet, and INT/TERM
+        # are forwarded explicitly — the server is not always in the signal's
+        # process group (systemd stop, a launcher's kill).
+        UI_PID=$ui_pid
+        trap 'if [ -n "${UI_PID:-}" ]; then kill "$UI_PID" 2>/dev/null || true; fi' EXIT
+        trap 'if [ -n "${UI_PID:-}" ]; then kill "$UI_PID" 2>/dev/null || true; fi; exit 130' INT
+        trap 'if [ -n "${UI_PID:-}" ]; then kill "$UI_PID" 2>/dev/null || true; fi; exit 143' TERM
+        local up=""
+        for _ in $(seq 1 50); do
+            sleep 0.1
+            kill -0 "$ui_pid" 2>/dev/null || break  # died at bind — its error is on our stderr
+            status="$(ui_health_status "$port")" || true
+            if [ -n "$status" ] && [ "$(ui_health_code "$status")" = "200" ]; then
+                up=1
+                break
+            fi
+        done
+        [ -n "$up" ] || die "UI server did not come up on $url (its error is above; try: mirrorling ui --port N)"
+    fi
+
+    echo "mirrorling UI: $url"
+    case "$open" in
+        browser) ui_open_browser_tab "$url" ;;
+        none)    ;;  # --no-open: URL printed above, nothing opened
+    esac
+
+    # A reused server is not ours to hold (exit 0 immediately); ours is held:
+    # this foreground wait is what keeps Ctrl-C taking the server down too.
+    if [ -n "$ui_pid" ]; then
+        local ui_rc=0
+        wait "$ui_pid" || ui_rc=$?
+        UI_PID=""   # reaped: the EXIT trap has nothing left to kill
+        return "$ui_rc"
+    fi
+}
+
+# mirrorling tray — the bar icon (waybar hosts the freedesktop StatusNotifierItem
+# protocol). It reflects the mirroring state and can open the panel or start/
+# stop mirroring even when the panel window is closed. Bare `mirrorling tray`
+# runs the helper in the FOREGROUND via exec: that is what the systemd unit
+# calls, and exec lets systemd supervise the helper itself rather than a bash
+# wrapper. enable/disable/status manage the unit.
+cmd_tray() {
+    local unit="mirrorling-tray.service"
+    local sysdir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    local file="$sysdir/$unit"
+    local sub="${1:-run}"
+    if [ $# -gt 0 ]; then shift; fi
+    case "$sub" in
+        run)
+            [ $# -eq 0 ] || die "tray run takes no arguments"
+            [ -x "$TRAY_BIN" ] || die "tray helper not built — run: make"
+            exec "$TRAY_BIN" --mirrorling "$SCRIPT_DIR/mirrorling" --ctl "$CTL"
+            ;;
+        enable)
+            [ $# -eq 0 ] || die "tray enable takes no arguments"
+            [ -x "$TRAY_BIN" ] || die "tray helper not built — run: make"
+            local before after was_active=0
+            before="$(cat "$file" 2>/dev/null || true)"
+            systemctl --user is-active --quiet "$unit" 2>/dev/null && was_active=1
+            ensure_tray_service
+            after="$(cat "$file" 2>/dev/null || true)"
+            systemctl --user daemon-reload
+            systemctl --user enable --now "$unit"
+            # enable --now leaves a running service untouched; a rewritten unit
+            # (mirrorling moved on PATH) needs a restart to pick up the new ExecStart
+            if [ "$before" != "$after" ] && [ "$was_active" = 1 ]; then
+                systemctl --user try-restart "$unit"
+            fi
+            echo "mirrorling: tray is $(systemctl --user is-active "$unit")"
+            ;;
+        disable)
+            [ $# -eq 0 ] || die "tray disable takes no arguments"
+            systemctl --user disable --now "$unit" 2>/dev/null || true
+            echo "mirrorling: tray disabled (icon gone until: mirrorling tray enable)"
+            ;;
+        status)
+            [ $# -eq 0 ] || die "tray status takes no arguments"
+            local act en items count=0
+            # is-active prints its answer AND exits non-zero for inactive
+            # units; `|| true` must not add a second "inactive" line.
+            act="$(systemctl --user is-active "$unit" 2>/dev/null)" || true
+            [ -n "$act" ] || act=inactive
+            act="${act%%$'\n'*}"
+            en="$(systemctl --user is-enabled "$unit" 2>/dev/null || true)"
+            [ "$en" = "enabled" ] || en=disabled
+            printf 'unit:    %s\n' "$act"
+            printf 'enabled: %s\n' "$en"
+            # Registration belongs to the bar's StatusNotifierWatcher, not to
+            # the helper's own bus name: an exported item is invisible without
+            # a watcher hosting it, so ask the watcher itself. `status` is the
+            # direct query; the name-list check keeps working with busctl
+            # versions/builds where status of a well-known name is unhappy.
+            local registered=0
+            if busctl --user status org.kde.StatusNotifierWatcher >/dev/null 2>&1; then
+                registered=1
+            elif busctl --user list 2>/dev/null | grep -Fq 'org.kde.StatusNotifierWatcher'; then
+                registered=1
+            fi
+            if [ "$registered" -eq 0 ]; then
+                echo "icon:    not registered (no StatusNotifierWatcher — enable your bar's tray module)"
+            else
+                items="$(busctl --user get-property org.kde.StatusNotifierWatcher \
+                    /StatusNotifierWatcher org.kde.StatusNotifierWatcher \
+                    RegisteredStatusNotifierItems 2>/dev/null || true)"
+                count="$(printf '%s\n' "$items" |
+                    awk -F'"' '{ for (i = 2; i <= NF; i += 2) n++ } END { print n + 0 }')"
+                echo "icon:    registered (StatusNotifierWatcher active, $count item(s))"
+            fi
+            ;;
+        *) die "unknown argument: $sub (use: enable, disable, status)" ;;
+    esac
+}
+
+# Install ~/.config/systemd/user/mirrorling-tray.service. Exec carries the
+# ABSOLUTE mirrorling path (launchers/systemd do not share this shell's cwd), and
+# prefers a stable mirrorling on PATH over $SCRIPT_DIR: when this runs from the
+# single-file app, SCRIPT_DIR is the cache extraction dir, which rotates with
+# every image update — the same rule as the desktop entry. PartOf ties the
+# helper to the graphical session; Restart=on-failure restarts crashes but a
+# clean Quit (or logout) stays down.
+ensure_tray_service() {
+    local dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    local file="$dir/mirrorling-tray.service"
+    local exec="$SCRIPT_DIR/mirrorling" onpath
+    onpath="$(command -v mirrorling 2>/dev/null || true)"
+    [ -n "$onpath" ] && [ "$onpath" != "$SCRIPT_DIR/mirrorling" ] && exec="$onpath"
+    local want have
+    want="[Unit]
+Description=mirrorling tray icon
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=\"$exec\" tray
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target"
+    mkdir -p "$dir"
+    have="$(cat "$file" 2>/dev/null || true)"
+    if [ "$have" = "$want" ]; then
+        return 0
+    fi
+    printf '%s\n' "$want" > "$file"
+    chmod 644 "$file"
+    echo "mirrorling: wrote $file"
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+    ""|help|-h|--help) usage ;;
+    version)  no_extra_args "$@"; echo "${MIRRORLING_VERSION:-dev}" ;;
+    discover) no_extra_args "$@"; cmd_discover ;;
+    target)   no_extra_args "$@"; cmd_target ;;
+    pair)     no_extra_args "$@"; cmd_pair ;;
+    start)    no_extra_args "$@"; cmd_start ;;
+    stop)     no_extra_args "$@"; cmd_stop ;;
+    status)   no_extra_args "$@"; cmd_status ;;
+    devices)  no_extra_args "$@"; cmd_devices ;;
+    monitors) cmd_monitors "$@" ;;
+    monitor)  cmd_monitor "$@" ;;
+    tvs)      cmd_tvs "$@" ;;
+    tv)       cmd_tv "$@" ;;
+    on)       cmd_on "$@" ;;
+    mirror)   cmd_on "$@" ;;
+    off)      no_extra_args "$@"; cmd_off ;;
+    toggle)   no_extra_args "$@"; cmd_toggle ;;
+    log)      cmd_log "$@" ;;
+    ui)       cmd_ui "$@" ;;
+    tray)     cmd_tray "$@" ;;
+    *)        usage; [ "$cmd" = "" ] || die "unknown command: $cmd" ;;
+esac

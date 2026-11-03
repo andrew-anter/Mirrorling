@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>samcast — samsung-cast</title>
+<title>Mirrorling</title>
 <style>
   :root {
     --bg: #0e1114;
@@ -317,6 +317,32 @@
     word-break: break-word;
   }
 
+  /* ---------- offline banner ---------- */
+  /* Shown when /api/state stops answering (owner window closed or the
+     machine's server died). Stale data must never look live. */
+  .banner {
+    margin: 14px 0 0;
+    padding: 10px 14px;
+    border: 1px solid var(--red);
+    border-left-width: 3px;
+    border-radius: 9px;
+    background: rgba(226, 109, 90, .10);
+    color: var(--ink);
+    font-size: 13px;
+    word-break: break-word;
+  }
+  .banner strong { color: var(--red); }
+  .banner code {
+    font-family: var(--mono);
+    font-size: 12px;
+    background: var(--panel-2);
+    border: 1px solid var(--seam);
+    border-radius: 5px;
+    padding: 1px 5px;
+  }
+  body.offline .pill { border-color: var(--red); }
+  body.offline .pill .dot { background: var(--red); animation: none; }
+
   /* ---------- toasts ---------- */
   #toasts {
     position: fixed;
@@ -353,8 +379,12 @@
 <body>
 <div class="wrap">
 
+  <div class="banner" id="offlineBanner" role="alert" hidden>
+    <strong>Control panel server closed</strong> — run: <code>mirrorling ui</code>
+  </div>
+
   <header>
-    <div class="wordmark"><span class="led" id="wmLed"></span>samcast&nbsp;<small>samsung-cast</small></div>
+    <div class="wordmark"><span class="led" id="wmLed"></span>Mirrorling&nbsp;<small>control panel</small></div>
     <div class="pill" id="pill"><span class="dot"></span><span class="txt" id="pillText"></span></div>
   </header>
 
@@ -438,6 +468,7 @@ function el(tag, cls, text) {
 
 async function getJSON(path) {
   var r = await fetch(path);
+  if (!r.ok) throw new Error('HTTP ' + r.status);
   return r.json();
 }
 
@@ -467,10 +498,21 @@ function toast(msg, isErr) {
 
 var state = null;        // last /api/state payload
 var pollBusy = false;
+var offlineShown = false;  // /api/state unreachable: the data above is stale
 var heroPending = null;  // 'on' | 'off' | 'start' | null
 var pinPending = false;
 var mutePending = false;
 var pinWasShown = false;
+
+// The owner may be an in-process server (window mode) or another mirrorling-ui:
+// whatever the reason, once polling fails the page must say so instead of
+// presenting stale state as live.
+function setOffline(on) {
+  if (offlineShown === on) return;
+  offlineShown = on;
+  $('offlineBanner').hidden = !on;
+  document.body.classList.toggle('offline', on);
+}
 
 function ctl() { return state && state.ctl ? state.ctl : null; }
 function phase() {
@@ -484,8 +526,17 @@ async function pollState() {
   pollBusy = true;
   try {
     var j = await getJSON('/api/state');
-    if (j && typeof j === 'object') { state = j; render(); }
-  } catch (e) { /* server gone — the page dies with it */ }
+    if (j && typeof j === 'object') {
+      state = j;
+      setOffline(false);
+      render();
+    }
+  } catch (e) {
+    // 502 from the attach proxy after the owner window exited, or nothing
+    // listening at all. Keep the last payload on screen but mark it stale:
+    // silently pretending it is live is the bug this banner exists for.
+    setOffline(true);
+  }
   pollBusy = false;
 }
 

@@ -14,9 +14,9 @@ import (
 const headerTimeout = 5 * time.Second
 
 // newCommand builds a command whose whole process group dies on timeout:
-// samcast is bash and spawns children of its own (doubletake-ctl, systemctl,
+// mirrorling is bash and spawns children of its own (doubletake-ctl, systemctl,
 // avahi-browse), so the CommandContext default of killing only the direct
-// child would orphan those grandchildren — a timed-out "samcast on" would
+// child would orphan those grandchildren — a timed-out "mirrorling on" would
 // leave a live doubletake-ctl connect behind while the caller already got
 // {ok:false, output:"timed out"}. WaitDelay bounds the wait when a killed
 // child's surviving grandchildren still hold the output pipes.
@@ -36,7 +36,7 @@ func newCommand(ctx context.Context, name string, args ...string) *exec.Cmd {
 // exec runs name with args under a per-call timeout derived from parent ctx.
 //
 // Stdin is left nil on purpose: os/exec then attaches the null device, so the
-// child never sees a TTY and samcast's interactive prompts (which are
+// child never sees a TTY and mirrorling's interactive prompts (which are
 // TTY-guarded) can never fire. Every call is logged to stderr with its
 // duration for debugging.
 func exec_(parent context.Context, timeout time.Duration, name string, args ...string) (exit int, stdout, stderr string, timedOut bool) {
@@ -112,10 +112,10 @@ func runCombined(parent context.Context, timeout time.Duration, name string, arg
 
 // sanitize validates a client-supplied string parameter: non-empty, at most
 // maxLen bytes, no control characters and no shell substitution
-// metacharacters ($, `) — samcast's config is sourced shell, and the UI is
-// the network-facing conduit: it must not pass through to samcast anything
+// metacharacters ($, `) — mirrorling's config is sourced shell, and the UI is
+// the network-facing conduit: it must not pass through to mirrorling anything
 // that becomes executable if a downstream denylist ever misses. The remaining
-// character policy is samcast's own to enforce, and its die message is
+// character policy is mirrorling's own to enforce, and its die message is
 // surfaced to the user.
 func sanitize(s string, maxLen int) (string, bool) {
 	if s == "" || len(s) > maxLen {

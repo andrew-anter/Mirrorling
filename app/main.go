@@ -1,7 +1,8 @@
-// samcast single-file launcher: one static binary carrying the whole
-// samsung-cast appliance (samcast CLI, samcast-picker, bin/doubletake,
-// bin/doubletake-ctl, bin/samcast-ui) as an embedded archive, staged by
-// `make app`. On first run it unpacks itself into the user's cache and execs
+// mirrorling single-file launcher: one static binary carrying the whole
+// mirrorling appliance (mirrorling CLI, mirrorling-picker, bin/doubletake,
+// bin/doubletake-ctl, bin/mirrorling-ui, bin/mirrorling-tray) plus the license files
+// (LICENSE, LICENSES/, THIRD-PARTY-NOTICES.md) as an embedded archive, staged
+// by `make app`. On first run it unpacks itself into the user's cache and execs
 // the real CLI from there; later runs reuse that tree, keyed by a content
 // hash so a changed image always extracts fresh.
 //
@@ -30,14 +31,21 @@ import (
 var assets embed.FS
 
 const (
-	brand = "samsung-cast"
+	brand = "mirrorling"
 	// app/assets/.gitignore is only the embed anchor for a not-yet-staged
 	// tree — not part of the appliance, so it is neither hashed nor extracted.
 	anchor = ".gitignore"
 )
 
+// Release identity, injected by `make app` with -X main.buildVersion and
+// -X main.buildCommit; a plain `go build` inside app/ keeps the placeholders.
+var (
+	buildVersion = "dev"
+	buildCommit  = "unknown"
+)
+
 func die(f string, a ...any) {
-	fmt.Fprintf(os.Stderr, "samcast: "+f+"\n", a...)
+	fmt.Fprintf(os.Stderr, "mirrorling: "+f+"\n", a...)
 	os.Exit(1)
 }
 
@@ -90,6 +98,16 @@ func cacheDir() string {
 	return ""
 }
 
+// assetMode is the permission bits an extracted asset gets: the appliance's
+// programs and scripts are executable, the shipped license paperwork is not.
+func assetMode(rel string) os.FileMode {
+	switch {
+	case rel == "LICENSE", rel == "THIRD-PARTY-NOTICES.md", strings.HasPrefix(rel, "LICENSES/"):
+		return 0o644
+	}
+	return 0o755
+}
+
 // extract unpacks the appliance into a sibling temp dir and renames it into
 // place. The rename onto an existing non-empty dir is the concurrent-first-run
 // guard: a rival extraction of the same image wins and ours is discarded.
@@ -118,7 +136,7 @@ func extract(dir, hash string) error {
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 			return fmt.Errorf("creating %s: %v", filepath.Dir(dst), err)
 		}
-		if err := os.WriteFile(dst, data, 0o755); err != nil {
+		if err := os.WriteFile(dst, data, assetMode(rel)); err != nil {
 			return fmt.Errorf("writing %s: %v", dst, err)
 		}
 	}
@@ -146,7 +164,7 @@ func extract(dir, hash string) error {
 // sweepGC prunes abandoned temp dirs from killed extractions and extraction
 // dirs of older images (every rebuilt image gets a fresh hash-keyed copy).
 // Old image dirs go only after a day: a concurrently running older image
-// (a second samcast on PATH, the tray unit) execs from its own dir and must
+// (a second mirrorling on PATH, the tray unit) execs from its own dir and must
 // not have it yanked mid-run — and things persisting paths into an extraction
 // dir (daemon unit, tray unit, desktop entry) re-resolve on their next run.
 // Best effort: cache housekeeping is never worth failing the launch over.
@@ -170,9 +188,20 @@ func sweepGC(dir string) {
 	}
 }
 
-// sniff warns (never blocks) about the engine's exec'd runtime deps, one
-// stderr line each, with the install hint for the running distro.
-func sniff() {
+// distroHint picks the apt hint on Debian-family systems, the pacman one
+// everywhere else.
+func distroHint(deb, other string) string {
+	if debianish() {
+		return deb
+	}
+	return other
+}
+
+// sniff warns (never blocks) about the runtime pieces the image deliberately
+// does not carry: tools the engine execs and the shared libraries the webview
+// UI links against. One stderr line each, with the install hint for the
+// running distro.
+func sniff(dir string) {
 	for _, dep := range []struct{ bin, deb, other string }{
 		{"gst-launch-1.0",
 			"apt install gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad",
@@ -182,10 +211,40 @@ func sniff() {
 			"pacman -S avahi (and enable avahi-daemon)"},
 	} {
 		if _, err := exec.LookPath(dep.bin); err != nil {
-			if debianish() {
-				dep.other = dep.deb
-			}
-			fmt.Fprintf(os.Stderr, "samcast: %s not found on PATH — casting needs it: %s\n", dep.bin, dep.other)
+			fmt.Fprintf(os.Stderr, "mirrorling: %s not found on PATH — casting needs it: %s\n", dep.bin, distroHint(dep.deb, dep.other))
+		}
+	}
+	sniffWebview(dir)
+}
+
+// sniffWebview reports unresolved gtk3/webkit2gtk sonames of the extracted UI
+// (it is CGO-built and dynamically linked; the image carries neither library).
+// ldd failing outright — no ldd, not a dynamic executable — leaves nothing
+// trustworthy to report, so this stays silent then.
+func sniffWebview(dir string) {
+	out, _ := exec.Command("ldd", filepath.Join(dir, "bin", "mirrorling-ui")).CombinedOutput()
+	if len(out) == 0 {
+		return
+	}
+	missing := make(map[string]bool, 2)
+	for _, line := range strings.Split(string(out), "\n") {
+		if !strings.Contains(line, "=> not found") {
+			continue
+		}
+		if f := strings.Fields(line); len(f) > 0 {
+			missing[f[0]] = true
+		}
+	}
+	for _, dep := range []struct{ lib, deb, other string }{
+		{"libwebkit2gtk-4.1.so.0",
+			"apt install libwebkit2gtk-4.1-0",
+			"pacman -S webkit2gtk-4.1"},
+		{"libgtk-3.so.0",
+			"apt install libgtk-3-0t64 (libgtk-3-0 before the time_t transition)",
+			"pacman -S gtk3"},
+	} {
+		if missing[dep.lib] {
+			fmt.Fprintf(os.Stderr, "mirrorling: %s missing — the control panel needs it: %s\n", dep.lib, distroHint(dep.deb, dep.other))
 		}
 	}
 }
@@ -226,7 +285,7 @@ func main() {
 	// wipe or disk damage leaves a correct stamp and no binary — exec would
 	// then die with a bare "no such file" on every later run). Our own keyed
 	// cache entry: drop it and extract fresh.
-	cli := filepath.Join(dir, "samcast")
+	cli := filepath.Join(dir, "mirrorling")
 	if _, err := os.Stat(cli); err != nil {
 		if err := os.RemoveAll(dir); err != nil {
 			die("clearing damaged extraction dir %s: %v", dir, err)
@@ -241,12 +300,21 @@ func main() {
 	if len(args) == 0 {
 		args = []string{"ui"} // this file IS the app: no arguments opens the control panel
 	}
-	if args[0] == "version" { // intercepted: identify the image, never reaches the CLI
-		fmt.Printf("samcast image %s\n%s\n", hash, dir)
+	switch args[0] {
+	case "version": // intercepted: identify the image, never reaches the CLI
+		fmt.Printf("Mirrorling image %s\nversion          %s (commit %s)\nextracted        %s\nlicenses         %s\n",
+			hash, buildVersion, buildCommit, dir, filepath.Join(dir, "LICENSES"))
+		return
+	case "--licenses": // intercepted: print the extracted license files, exit 0
+		fmt.Println("Mirrorling is MIT-licensed; bundled components keep their own licenses.")
+		fmt.Printf("  %s\n", filepath.Join(dir, "LICENSE"))
+		fmt.Printf("  %s/ (LGPL-3.0.txt, GPL-3.0.txt)\n", filepath.Join(dir, "LICENSES"))
+		fmt.Printf("  %s (verbatim third-party license texts)\n", filepath.Join(dir, "LICENSES", "THIRD-PARTY.txt"))
+		fmt.Printf("  %s\n", filepath.Join(dir, "THIRD-PARTY-NOTICES.md"))
 		return
 	}
 
-	sniff()
+	sniff(dir)
 
 	// Exec replaces this process: signals/Ctrl-C behave exactly as under the
 	// plain bash CLI.
