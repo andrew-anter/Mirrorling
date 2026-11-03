@@ -439,10 +439,18 @@ ensure_picker() {
         if [ "$have" = "$want" ]; then
             return 0  # already ours — nothing to do
         fi
-        if [ -n "$have" ] && [ "${have##*/}" != "mirrorling-picker" ]; then
+        # Ours means: any mirrorling-picker, or a pre-rename samsung-cast/
+        # samcast picker — those names no longer exist on disk, so refusing
+        # to reclaim them strands xdph on a dangling path and every cast
+        # dies with "portal request was canceled". Anything else is a
+        # genuinely foreign picker: leave it alone.
+        case "${have##*/}" in
+            # empty (a bare key with no value) is ours to reclaim too
+            ''|mirrorling-picker|samsung-cast-picker|samcast-picker|doubletake-picker) ;;
+            *)
             echo "mirrorling: warning: $conf already sets $key to '$have' — not clobbering it" >&2
             return 0
-        fi
+        esac
         # Ours (a stale extraction dir from an earlier image, or an empty
         # value): rewrite in place — write the new key first, then the old
         # file minus that key. printf+grep keeps $want's characters (SCRIPT_DIR

@@ -9,6 +9,12 @@ All notable changes to this project are documented here. The format loosely foll
 
 ### Fixed
 
+- **Casts fail with "portal request was canceled" after upgrading from samsung-cast/samcast.**
+  `xdph.conf` written by a pre-rename release points `screencopy:custom_picker_binary` at the old
+  `samcast-picker`/`samsung-cast-picker` path, which no longer exists — and `ensure_picker` only
+  reclaimed paths ending in `mirrorling-picker`, treating the legacy names as a foreign picker it
+  must not clobber. Legacy picker names are now reclaimed (rewritten to the live
+  `mirrorling-picker`, portal restarted); genuinely foreign pickers are still left alone.
 - **TV volume no longer jumps to 100% after a cast.** The engine sent AirPlay
   `SET_PARAMETER volume: 0.000000` (0 dB = full scale) at session start, and the TV's firmware
   restores its start-of-session volume snapshot when the session closes — so the TV always ended

@@ -614,6 +614,48 @@ test_picker_setup() {
     ok "unwritable xdph.conf is left alone and start continues"
 }
 
+# The pre-rename appliances shipped pickers named samsung-cast-picker /
+# samcast-picker; a user's xdph.conf may still point at one of those dangling
+# paths. ensure_picker must reclaim them (rewrite to the live picker, restart
+# the portal) instead of treating them as foreign — the rename otherwise
+# strands every cast on a missing binary ("portal request was canceled").
+# A genuinely foreign picker is still left alone.
+test_picker_reclaim() {
+    reset_state
+    mkdir -p "$(dirname "$(conf_path)")" "$XDG_CONFIG_HOME/hypr"
+    printf 'MIRRORLING_NAME="Sam58"\n' > "$(conf_path)"
+    printf '{"state":"idle"}\n' > "$STUB_DIR/status.json"
+    : > "$STUB_DIR/hyprctl.ok"
+    local out calls
+    for legacy in samsung-cast-picker samcast-picker doubletake-picker; do
+        printf '# samsung-cast manages the key below\nscreencopy:custom_picker_binary = /home/andrew/projects/samsung-cast/%s\nfont=1\n' \
+            "$legacy" > "$XDG_CONFIG_HOME/hypr/xdph.conf"
+        : > "$STUB_DIR/systemctl.calls"
+        out="$(WAYLAND_DISPLAY=wayland-1 "$APP/mirrorling" start 2>&1)" ||
+            fail "start aborted on a legacy $legacy picker path: $out"
+        assert_not_contains "$out" "not clobbering" "legacy $legacy is not treated as foreign"
+        assert_contains "$(cat "$XDG_CONFIG_HOME/hypr/xdph.conf")" "$APP/mirrorling-picker" "legacy $legacy path is rewritten to the live picker"
+        assert_contains "$(cat "$XDG_CONFIG_HOME/hypr/xdph.conf")" "font=1" "rewrite keeps foreign keys beside the picker key"
+        calls="$(cat "$STUB_DIR/systemctl.calls" 2>/dev/null || true)"
+        assert_contains "$calls" "restart xdg-desktop-portal-hyprland" "reclaiming $legacy restarts the portal"
+        ok "legacy picker name $legacy is reclaimed"
+    done
+
+    reset_state
+    mkdir -p "$(dirname "$(conf_path)")" "$XDG_CONFIG_HOME/hypr"
+    printf 'MIRRORLING_NAME="Sam58"\n' > "$(conf_path)"
+    printf '{"state":"idle"}\n' > "$STUB_DIR/status.json"
+    : > "$STUB_DIR/hyprctl.ok"
+    printf 'screencopy:custom_picker_binary = /usr/bin/my-own-picker\n' > "$XDG_CONFIG_HOME/hypr/xdph.conf"
+    : > "$STUB_DIR/systemctl.calls"
+    out="$(WAYLAND_DISPLAY=wayland-1 "$APP/mirrorling" start 2>&1)" ||
+        fail "start aborted on a foreign picker path: $out"
+    assert_contains "$out" "not clobbering" "a foreign picker still gets the not-clobbering warning"
+    assert_contains "$(cat "$XDG_CONFIG_HOME/hypr/xdph.conf")" "/usr/bin/my-own-picker" "a foreign picker path is left untouched"
+    calls="$(cat "$STUB_DIR/systemctl.calls" 2>/dev/null || true)"
+    assert_not_contains "$calls" "restart xdg-desktop-portal-hyprland" "a foreign picker does not trigger a portal restart"
+}
+
 # A read-only ~/.config/hypr (writable file or not) makes both the create and
 # the rewrite branch fail. Bash reports a failed group-level redirection as
 # status 0, so the create branch used to claim success, restart the portal and
@@ -886,6 +928,7 @@ test_env_fps_start
 test_systemd_run_failure
 test_stale_socket
 test_picker_setup
+test_picker_reclaim
 test_picker_write_failure
 test_tray_status
 test_ui
