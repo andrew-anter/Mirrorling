@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format loosely foll
 
 ## [Unreleased]
 
+## [0.1.1-alpha] — 2026-11-04
+
 ### Fixed
 
 - **TV volume no longer jumps to 100% after a cast.** The engine sent AirPlay
@@ -115,4 +117,5 @@ First public beta.
 - `docs/cu7000.md` updated: hostname and device MAC redacted, XDPH restore-token behavior
   corrected, current quirks and README link added.
 
+[0.1.1-alpha]: https://github.com/andrew-anter/mirrorling/releases
 [0.1.0-beta.1]: https://github.com/andrew-anter/mirrorling/releases
