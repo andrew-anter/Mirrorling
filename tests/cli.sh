@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 Mirrorling contributors.
+#
 # Regression tests for the mirrorling CLI (mirrorling + mirrorling-picker integration).
 #
 # Plain bash; no root, no network, no TV. Everything runs against a private

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026 Mirrorling contributors.
+
 // Command mirrorling-tray is the mirrorling tray helper: one StatusNotifierItem
 // icon in the waybar/freedesktop tray whose pixmap and tooltip mirror the
 // mirroring state, with a menu to open the control panel and start/stop

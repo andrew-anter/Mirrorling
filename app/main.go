@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026 Mirrorling contributors.
+
 // mirrorling single-file launcher: one static binary carrying the whole
 // mirrorling appliance (mirrorling CLI, mirrorling-picker, bin/doubletake,
 // bin/doubletake-ctl, bin/mirrorling-ui, bin/mirrorling-tray) plus the license files

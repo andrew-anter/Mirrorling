@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026 Mirrorling contributors.
+
 // Command mirrorling-ui serves the mirrorling local web control panel.
 //
 // By default it runs as a plain headless HTTP server. With --window it opens

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026 Mirrorling contributors.
+
 package main
 
 // The com.canonical.dbusmenu surface waybar's libdbusmenu client talks to:
