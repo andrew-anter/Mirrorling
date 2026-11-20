@@ -321,6 +321,78 @@ With `auto`, no monitor is pinned: XDPH runs `hyprland-share-picker`, which prom
 have configured its `allow_token_by_default` option. Pinning a monitor avoids the prompt
 entirely through mirrorling's own picker.
 
+### Streaming a dedicated workspace from a virtual display
+
+`mirrorling monitor virtual` pins a **headless compositor output** instead of a physical screen
+(Hyprland, or Sway with its headless backend). The TV then shows a workspace bound to that output,
+so nothing on the laptop has to be visible in the cast: the laptop keeps its own workspaces while
+the TV carries a second desktop.
+
+```sh
+mirrorling monitor virtual   # pin it; creates the headless output now so you can arrange it
+mirrorling on                # the cast captures that output (recreated if it went missing)
+mirrorling monitors          # the output is listed and marked "(configured)"
+mirrorling monitor auto      # back to the picker/dialog
+```
+
+The output is named by `MIRRORLING_VIRTUAL` (default `mirrorling`). Hyprland does not keep headless
+outputs across restarts, so mirrorling creates it before starting the daemon and the picker
+recreates it as a fallback; casting the laptop screen instead would be silent, so a failed creation
+aborts the cast. Layout and the workspace binding stay in your Hyprland config — they describe the
+desktop, not the cast:
+
+```ini
+# ~/.config/hypr/hyprland.conf (keyword syntax)
+exec-once = hyprctl output create headless mirrorling   # optional: have it from login
+monitor = mirrorling, 1920x1080@60, auto-right, 1
+workspace = 6, monitor:mirrorling, persistent:true     # the workspace the TV shows
+```
+
+```lua
+-- Lua config equivalent
+hl.monitor({ output = "mirrorling", mode = "1920x1080@60", position = "auto-right", scale = 1 })
+hl.workspace_rule({ workspace = 6, monitor = "mirrorling", persistent = true })
+hl.on("hyprland.start", function() hl.exec_cmd("hyprctl output create headless mirrorling") end)
+```
+
+Send a window there with your "move to workspace 6" bind (`Super+SHIFT+6` by default); switching to
+that workspace focuses the virtual output, so the keyboard and pointer drive what the TV shows while
+the laptop's screens keep whatever they displayed. The pointer reaches that workspace only by moving
+across the monitor edge — the output sits in Hyprland's layout like any other monitor.
+
+#### Other compositors
+
+Only two things are compositor-specific: adding the headless output and binding a workspace to it.
+Capture is the portal's job in every session, so `mirrorling monitor <NAME>` casts any output that
+portal can see.
+
+| Session | Virtual output | Dialog-free pinning |
+|---|---|---|
+| Hyprland | `hyprctl output create headless` (mirrorling creates it) | `mirrorling-picker` as XDPH's `custom_picker_binary` (automatic) |
+| Sway, wlroots headless backend | `swaymsg create_output` (mirrorling creates it; Sway names it `HEADLESS-N`, 1920×1080) | portal chooser; pin it with `chooser_type=none` + `output_name=HEADLESS-N` in `~/.config/xdg-desktop-portal-wlr/config`, then restart `xdg-desktop-portal-wlr` |
+| KDE Plasma 6 | no native headless output: `krfb-virtualmonitor` adds one (KRfb), or use a spare output | portal picker once; the engine's restore token keeps it silent afterwards |
+| GNOME | no runtime virtual monitor: `gnome-remote-desktop` headless session, or a dummy-plug/EDID output | portal picker once, then the restore token |
+| X11 | none (Xorg `dummy` driver or a real second output) | `MIRRORLING_MONITOR` → `DOUBLETAKE_MONITOR` (existing X11 path) |
+
+Where the compositor cannot add an output, `mirrorling monitor virtual` refuses with the
+alternative spelled out — it never silently casts the laptop screen.
+
+Sway only creates outputs from a headless backend that was enabled at session start
+(`WLR_BACKENDS=headless,libinput`, or your current list plus `headless`); `swaymsg create_output`
+cannot add the backend later. Then bind the workspace in the Sway config:
+
+```ini
+# ~/.config/sway/config
+workspace 6 output HEADLESS-1        # the workspace the TV shows
+output HEADLESS-1 mode 1920x1080     # optional: explicit mode
+```
+
+Restore tokens are scoped per capture source (`DOUBLETAKE_RESTORE_SCOPE`): portals that implement
+session restore (KDE, GNOME, any frontend supporting `persist_mode`) remember one source per scope,
+so a duplicate and an extend session cannot overwrite each other's token and each cast after the
+first is dialog-free. `xdg-desktop-portal-wlr` has no restore support, which is why its pin is a
+config file instead.
+
 ### Why a custom picker on Wayland
 
 XDPH **does** implement portal restore tokens. However, its stock picker only requests a token
@@ -436,7 +508,11 @@ The panel is also listed in desktop launchers as **Mirrorling** because each suc
 stale. `Exec` carries an absolute path, preferring `mirrorling` found on `PATH` over a rotating
 extraction directory. The panel shows live and saved TVs, lets you forget saved ones, switches
 TV/monitor, starts/stops the daemon and mirroring, and can submit the TV PIN for a first-time
-cast.
+cast. Its **Display** card offers the two modes the setting maps to: **Duplicate** casts a screen
+exactly as it looks here (Auto = share-picker dialog each cast, or a named monitor), and
+**Extend** pins the [virtual display](#streaming-a-dedicated-workspace-from-a-virtual-display) so
+the TV gets its own screen. Extend is disabled with the reason when the session cannot create a
+headless output (no Hyprland).
 
 The panel API is **localhost-only, unauthenticated and same-user trusted**: anything that can
 reach `127.0.0.1:8791` can control it. See [Security and privacy](#security-and-privacy) and
@@ -522,7 +598,9 @@ environment variables, which override the file, and missing keys fall back to th
 | `MIRRORLING_PORT_RANGE` | `60000-60010` | Local UDP range for timing, audio control and audio data. |
 | `MIRRORLING_TIMING` | `NTP` | `NTP` or `PTP`. The CU7000 advertises PTP but omits `timingPeerInfo.ClockID` in SETUP, so it needs `NTP`. |
 | `MIRRORLING_EXTRA_FLAGS` | empty | Extra doubletake flags, e.g. `"-bitrate 4500 -no-audio"` or `"-video-codec hevc"`. |
-| `MIRRORLING_MONITOR` | empty | Pinned capture monitor; empty means the picker/dialog. Prefer `mirrorling monitor`. |
+| `MIRRORLING_MONITOR` | empty | Pinned capture monitor, or `virtual` for the headless output; empty means the picker/dialog. Prefer `mirrorling monitor`. |
+| `MIRRORLING_VIRTUAL` | `mirrorling` | Name of the headless output behind `mirrorling monitor virtual`; created on demand. |
+| `MIRRORLING_RELAY_BUDGET_MS` | `5000` | How long a stalled TV video socket may queue frames — and how long one frame write may block — before that receiver is dropped (engine `DOUBLETAKE_RELAY_BUDGET_MS`). Raise for links that stall longer; the engine's upstream default is 250 ms, which real Wi-Fi receiver hiccups exceed. |
 
 Notes:
 
@@ -678,8 +756,9 @@ systemctl --user restart xdg-desktop-portal-hyprland.service
 ## Known limits
 
 - **One TV and one monitor at a time.** Mirroring is to the configured TV from the pinned
-  monitor (or the portal's picker). Monitor pinning and the headless picker are Hyprland-specific;
-  other Wayland compositors are untested.
+  monitor (or the portal's picker). The headless picker is Hyprland-only; Sway can create the
+  virtual output, other Wayland compositors need one portal pick (see
+  [Other compositors](#other-compositors)).
 - **Pin expiry.** The CU7000's on-TV PIN is valid for only about 17 seconds; after ~45 seconds
   pairing fails with an SRP authentication error. Re-run `mirrorling pair`.
 - **Standby kills casting.** A TV in standby has no Wi-Fi and no mDNS; power it on first.

@@ -39,6 +39,8 @@ MIRRORLING_PORT_RANGE="${MIRRORLING_PORT_RANGE:-60000-60010}"
 MIRRORLING_TIMING="${MIRRORLING_TIMING:-NTP}"     # NTP | PTP — some Samsung models advertise PTP but omit ClockID in SETUP (upstream #30)
 MIRRORLING_EXTRA_FLAGS="${MIRRORLING_EXTRA_FLAGS:-}"  # extra doubletake flags, e.g. "-bitrate 4500 -no-audio"
 MIRRORLING_MONITOR="${MIRRORLING_MONITOR:-}"      # monitor to cast ("" = picker dialog per cast; see: mirrorling monitor / mirrorling monitors)
+MIRRORLING_VIRTUAL="${MIRRORLING_VIRTUAL:-mirrorling}"  # headless output behind 'mirrorling monitor virtual' (created on demand)
+MIRRORLING_RELAY_BUDGET_MS="${MIRRORLING_RELAY_BUDGET_MS:-5000}"  # how long a stalled TV socket may queue video before that receiver is dropped (ms)
 EOF
     echo "mirrorling: wrote default config to $CONF" >&2
 fi
@@ -48,14 +50,14 @@ fi
 # for hand-written configs too. ${VAR+x} is the only unset-safe presence test
 # under `set -u`; ${!_var+x} works the same through an indirect name.
 declare -A _env_override=()
-for _key in NAME FPS HWACCEL PORT_RANGE TIMING EXTRA_FLAGS MONITOR; do
+for _key in NAME FPS HWACCEL PORT_RANGE TIMING EXTRA_FLAGS MONITOR VIRTUAL RELAY_BUDGET_MS; do
     _var="MIRRORLING_$_key"
     if [ -n "${!_var+x}" ]; then _env_override["$_key"]="${!_var}"; fi
 done
 unset _key _var
 # shellcheck source=/dev/null
 source "$CONF"
-for _key in NAME FPS HWACCEL PORT_RANGE TIMING EXTRA_FLAGS MONITOR; do
+for _key in NAME FPS HWACCEL PORT_RANGE TIMING EXTRA_FLAGS MONITOR VIRTUAL RELAY_BUDGET_MS; do
     if [ -n "${_env_override[$_key]+x}" ]; then
         printf -v "MIRRORLING_$_key" '%s' "${_env_override[$_key]}"
     fi
@@ -72,6 +74,8 @@ MIRRORLING_PORT_RANGE="${MIRRORLING_PORT_RANGE:-60000-60010}"
 MIRRORLING_TIMING="${MIRRORLING_TIMING:-NTP}"
 MIRRORLING_EXTRA_FLAGS="${MIRRORLING_EXTRA_FLAGS:-}"
 MIRRORLING_MONITOR="${MIRRORLING_MONITOR:-}"
+MIRRORLING_VIRTUAL="${MIRRORLING_VIRTUAL:-mirrorling}"
+MIRRORLING_RELAY_BUDGET_MS="${MIRRORLING_RELAY_BUDGET_MS:-5000}"
 
 # Samsung Tizen advertises PTP but its SETUP omits timingPeerInfo.ClockID —
 # force NTP unless overridden (upstream doubletake issue #30, Finding 3).
@@ -93,9 +97,11 @@ Mirrorling — mirror this desktop to $tv (AirPlay 2)
   mirrorling off             stop mirroring
   mirrorling toggle          mirror on <-> off (bind this to a key)
   mirrorling devices         devices the daemon can see
-  mirrorling monitors        list connectable monitors (Hyprland outputs / X11 screens)
-  mirrorling monitor [NAME|auto]
-                          show or set the monitor to cast (auto = picker dialog per cast)
+  mirrorling monitors        list connectable outputs (Hyprland/Sway outputs, X11 screens)
+  mirrorling monitor [NAME|auto|virtual]
+                          show or set the monitor to cast (auto = picker dialog
+                          per cast; virtual = headless output for a stream-only
+                          workspace, created on demand)
   mirrorling tvs             list Samsung TVs seen on the LAN or saved earlier (the configured one is marked)
   mirrorling tv [NAME|--forget NAME]
                           show, set, or forget the TV to cast (a name is always required; no auto)
@@ -112,7 +118,8 @@ Mirrorling — mirror this desktop to $tv (AirPlay 2)
 --raw after tvs/tv/monitors/monitor prints machine-readable output, for the UI.
 
 Env overrides after config: MIRRORLING_NAME, MIRRORLING_FPS, MIRRORLING_HWACCEL,
-MIRRORLING_PORT_RANGE, MIRRORLING_TIMING, MIRRORLING_EXTRA_FLAGS, MIRRORLING_MONITOR.
+MIRRORLING_PORT_RANGE, MIRRORLING_TIMING, MIRRORLING_EXTRA_FLAGS, MIRRORLING_MONITOR,
+MIRRORLING_VIRTUAL, MIRRORLING_RELAY_BUDGET_MS.
 EOF
 }
 
@@ -164,17 +171,136 @@ tv_name_ok() {
     return 0
 }
 
-# Capture-capable monitor names, one per line, on stdout. Wayland/Hyprland is
-# the primary target (names are Hyprland outputs; hyprctl missing/failing
-# there is terminal — no xrandr guesswork); xrandr covers the X11 fallback.
-# Neither session → print nothing, caller decides. The space in `/ connected/`
-# keeps xrandr's "disconnected" from matching.
-list_monitors() {
-    if [ -n "${WAYLAND_DISPLAY:-}" ]; then
-        hyprctl monitors 2>/dev/null | awk '$1=="Monitor"{print $2}' || true
-    elif [ -n "${DISPLAY:-}" ]; then
-        xrandr --query 2>/dev/null | awk '/ connected/ {print $1}' || true
+# Which compositor's control interface answers right now, for the pieces that
+# are NOT portable: adding an output and enumerating outputs. Capture itself is
+# the portal's job on every Wayland compositor.
+compositor() {
+    if command -v hyprctl >/dev/null 2>&1 && hyprctl monitors >/dev/null 2>&1; then
+        printf 'hyprland\n'
+    elif command -v swaymsg >/dev/null 2>&1 && swaymsg -t get_outputs >/dev/null 2>&1; then
+        printf 'sway\n'
+    else
+        printf 'other\n'
     fi
+}
+
+# Output names as Sway reports them. `--raw` is JSON, and one "name" per output
+# is all that is needed — no jq dependency for a single field.
+sway_output_names() {
+    swaymsg -t get_outputs --raw 2>/dev/null |
+        sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' || true
+}
+
+# Capture-capable monitor names, one per line, on stdout. Hyprland and Sway
+# expose their outputs over a control socket; no other Wayland compositor can
+# be asked from a CLI (its portal picker still works), so only X11 falls back
+# to xrandr. Print nothing when nobody answers — the caller decides. The space
+# in `/ connected/` keeps xrandr's "disconnected" from matching.
+list_monitors() {
+    case "$(compositor)" in
+        hyprland) hyprctl monitors 2>/dev/null | awk '$1=="Monitor"{print $2}' || true ;;
+        sway)     sway_output_names ;;
+        *)
+            if [ -n "${DISPLAY:-}" ]; then
+                xrandr --query 2>/dev/null | awk '/ connected/ {print $1}' || true
+            fi
+            ;;
+    esac
+}
+
+# Is NAME a live output right now? A compositor that cannot be asked (no
+# session, no control socket) counts as not connected.
+monitor_connected() {
+    list_monitors | grep -Fxq -e "$1"
+}
+
+# One variable from the running daemon unit's fixed environment ("" when the
+# unit is down or the variable was never set).
+daemon_env() {
+    systemctl --user show "$UNIT" -p Environment 2>/dev/null |
+        sed -n 's/^Environment=//p' | tr ' ' '\n' | sed -n "s/^$1=//p" || true
+}
+
+# The requested headless output name (MIRRORLING_VIRTUAL). Hyprland uses it;
+# Sway names headless outputs itself (HEADLESS-N) and takes no name.
+virtual_monitor_name() { printf '%s\n' "${MIRRORLING_VIRTUAL:-mirrorling}"; }
+
+# The virtual display's current output name: an existing headless output wins
+# (Sway numbers them, and reusing the first one keeps repeated casts from
+# stacking outputs), else the configured name.
+virtual_output_name() {
+    local name=""
+    if [ "$(compositor)" = sway ]; then
+        name="$(sway_output_names | grep -m1 '^HEADLESS' || true)"
+    fi
+    printf '%s\n' "${name:-$(virtual_monitor_name)}"
+}
+
+# The capture source this run should use: "" (auto — the portal picker
+# decides), a real output name, or the virtual output's name. Every consumer
+# (daemon env, drift check, monitors list) works on this resolved value so
+# 'virtual' never leaks into X11's DOUBLETAKE_MONITOR contract.
+resolved_monitor() {
+    if [ "${MIRRORLING_MONITOR:-}" = virtual ]; then
+        virtual_output_name
+    else
+        printf '%s\n' "${MIRRORLING_MONITOR:-}"
+    fi
+}
+
+# MIRRORLING_MONITOR=virtual casts a headless output instead of a physical
+# screen: a workspace bound to it (in the user's own compositor config) reaches
+# the TV while the laptop's screens stay usable. Compositors do not keep
+# headless outputs across restarts, so create it on demand — silently casting
+# another screen would expose the laptop. Layout (mode, position, scale), the
+# workspace binding and which portal picks the source stay in the user's
+# config: they are desktop preferences, not cast state. No-op unless 'virtual'
+# is pinned, so real monitors and 'auto' never touch the compositor.
+#
+# Only Hyprland and Sway (with its headless backend) can add an output to a
+# running session; anywhere else mirrorling refuses with the alternative
+# spelled out instead of pretending.
+ensure_virtual_monitor() {
+    [ "${MIRRORLING_MONITOR:-}" = virtual ] || return 0
+    local name err _
+    case "$(compositor)" in
+        hyprland)
+            name="$(virtual_monitor_name)"
+            monitor_connected "$name" && return 0
+            if ! hyprctl output create headless "$name" >/dev/null 2>&1; then
+                echo "mirrorling: cannot create the virtual output '$name' (hyprctl output create headless failed)" >&2
+                return 1
+            fi
+            ;;
+        sway)
+            name="$(sway_output_names | grep -m1 '^HEADLESS' || true)"
+            if [ -z "$name" ]; then
+                # swaymsg takes no name: Sway adds HEADLESS-N at 1920x1080.
+                err="$(swaymsg create_output 2>&1 || true)"
+                for _ in $(seq 1 20); do
+                    name="$(sway_output_names | grep -m1 '^HEADLESS' || true)"
+                    [ -n "$name" ] && break
+                    sleep 0.1
+                done
+                if [ -z "$name" ]; then
+                    echo "mirrorling: cannot create a virtual output: ${err:-swaymsg create_output failed}" >&2
+                    echo "mirrorling: Sway only adds outputs from a headless backend — start it with WLR_BACKENDS=headless,libinput (see README)" >&2
+                    return 1
+                fi
+            fi
+            ;;
+        *)
+            echo "mirrorling: 'virtual' needs a compositor that can add a headless output (Hyprland, or Sway with its headless backend)" >&2
+            echo "mirrorling: cast an existing output instead — mirrorling monitor <NAME> (mirrorling monitors lists them), or mirrorling monitor auto" >&2
+            return 1
+            ;;
+    esac
+    for _ in $(seq 1 20); do
+        monitor_connected "$name" && return 0
+        sleep 0.1
+    done
+    echo "mirrorling: virtual output '$name' did not appear after creation" >&2
+    return 1
 }
 
 # One parse of the same avahi-browse invocation match_target uses: one line
@@ -545,6 +671,7 @@ select_monitor() {
 
 cmd_start() {
     ensure_picker
+    ensure_virtual_monitor || exit 1
     if systemctl --user is-active --quiet "$UNIT"; then
         echo "daemon already running"
     else
@@ -562,9 +689,26 @@ cmd_start() {
         # Wayland ignores it — its selection is xdph's picker. The daemon env
         # is fixed at spawn, so pass it only when set.
         local -a envs=(--setenv="DOUBLETAKE_TIMING=$DOUBLETAKE_TIMING")
-        if [ -n "$MIRRORLING_MONITOR" ]; then
-            envs+=(--setenv="DOUBLETAKE_MONITOR=$MIRRORLING_MONITOR")
+        local src
+        src="$(resolved_monitor)"
+        if [ -n "$src" ]; then
+            envs+=(--setenv="DOUBLETAKE_MONITOR=$src")
         fi
+        # Portals with restore tokens (KDE, GNOME, and any other
+        # xdg-desktop-portal frontend) keep one token per named scope, so a
+        # duplicate and an extend session cannot overwrite each other's token:
+        # each stays dialog-free after its own first pick. The engine already
+        # implements the per-scope map; an unset scope would collapse both into
+        # the legacy single token.
+        envs+=(--setenv="DOUBLETAKE_RESTORE_SCOPE=${src:-auto}")
+        # The engine detaches a receiver whose video socket stalls for longer than its
+        # relay budget (upstream default 250 ms) — and it bounds one frame write
+        # by the same budget. The CU7000 stops draining for 2 s+ now and then
+        # (Wi-Fi receiver hiccups; the LAN itself shows 0 % loss, ~6 ms RTT), so a
+        # quarter second of tolerance ended every cast. 5 s rides those stalls
+        # out; memory stays under the engine's 8 MiB queue bound (~2.6 MB at
+        # 4.1 Mbit/s).
+        envs+=(--setenv="DOUBLETAKE_RELAY_BUDGET_MS=${MIRRORLING_RELAY_BUDGET_MS:-5000}")
         # Capture systemd-run's stderr: under `set -e` a bare failure would
         # dump its raw message and exit, hiding the actionable hint. --collect
         # makes the transient unit (and its failure state) disappear with it.
@@ -594,9 +738,10 @@ cmd_monitors() {
     local raw=""
     if [ "${1:-}" = "--raw" ]; then raw=1; shift; fi
     [ $# -eq 0 ] || die "unknown argument: $1"
-    local names name i=0 suffix
+    local names name i=0 suffix want
+    want="$(resolved_monitor)"
     names="$(list_monitors)"
-    [ -n "$names" ] || die "no monitors found (Wayland needs hyprctl + a Hyprland session; X11 needs xrandr + DISPLAY)"
+    [ -n "$names" ] || die "no monitors found (needs a compositor control socket — Hyprland hyprctl, Sway swaymsg — or X11 xrandr + DISPLAY)"
     if [ -n "$raw" ]; then
         printf '%s\n' "$names"
         return
@@ -605,7 +750,7 @@ cmd_monitors() {
     while IFS= read -r name; do
         i=$((i + 1))
         suffix=""
-        if [ "$name" = "$MIRRORLING_MONITOR" ]; then suffix=" (configured)"; fi
+        if [ "$name" = "$want" ]; then suffix=" (configured)"; fi
         printf '  [%d] %s%s\n' "$i" "$name" "$suffix"
     done <<<"$names"
 }
@@ -641,6 +786,21 @@ cmd_monitor() {
     case "$name" in
         *[!A-Za-z0-9_-]*) die "invalid monitor name '$name' (letters, digits, '-' and '_' only, e.g. eDP-1)" ;;
     esac
+    # 'virtual' is a reserved alias, never an output name: it resolves to the
+    # headless output named by MIRRORLING_VIRTUAL. Create it now so the user
+    # can arrange the streaming workspace without starting a cast. The
+    # in-memory value is set first (ensure_virtual_monitor keys off it) but the
+    # config is written only once the output exists.
+    if [ "$name" = virtual ]; then
+        MIRRORLING_MONITOR="$name"
+        ensure_virtual_monitor || die "'virtual' not configured — nothing was changed"
+        set_config_var MIRRORLING_MONITOR "$name"
+        local out
+        out="$(virtual_output_name)"
+        echo "will cast the virtual display '$out' (recreated on demand; 'mirrorling monitor auto' reverts)"
+        echo "workspace: bind one to that output in your compositor config (e.g. Hyprland 'workspace = 6, monitor:$out', Sway 'workspace 6 output $out') — it stays off the laptop, the TV shows it"
+        return
+    fi
     # Not currently connected is not fatal — allow setting anyway (the monitor
     # may be undocked now but docked again before the next cast; xdph's picker
     # falls back to the GUI until then).
@@ -766,6 +926,7 @@ cmd_on() {
     local pin="${1:-}"
     resolve_target
     ensure_picker  # Wayland: keep xdph pointed at mirrorling-picker (idempotent)
+    ensure_virtual_monitor || exit 1
     # Picking once here (first interactive cast with >1 monitor, nothing
     # configured) makes every later cast dialog-free: xdph re-runs its picker
     # per request and the stored choice short-circuits it.
@@ -773,15 +934,25 @@ cmd_on() {
 
     if systemctl --user is-active --quiet "$UNIT"; then
         # The daemon's env is fixed at spawn. If its recorded DOUBLETAKE_MONITOR
-        # (the X11 capture monitor — Wayland ignores it) drifted from the
-        # current choice, restart so the change takes effect. Desired value is
-        # absent when MIRRORLING_MONITOR is empty (auto).
-        local want="${MIRRORLING_MONITOR:-}" have=""
-        have="$(systemctl --user show "$UNIT" -p Environment 2>/dev/null |
-            sed -n 's/^Environment=//p' | tr ' ' '\n' |
-            sed -n 's/^DOUBLETAKE_MONITOR=//p' || true)"
-        if [ "$have" != "$want" ]; then
-            echo "mirrorling: capture monitor changed (${have:-auto} -> ${want:-auto}) — restarting the daemon"
+        # (the X11 capture monitor — Wayland ignores it) or the restore-token
+        # scope drifted from the current choice, restart so the change takes
+        # effect. Desired values are absent/auto when nothing is pinned.
+        local want have want_scope have_scope want_budget have_budget
+        want="$(resolved_monitor)"
+        want_scope="${want:-auto}"
+        want_budget="${MIRRORLING_RELAY_BUDGET_MS:-5000}"
+        have="$(daemon_env DOUBLETAKE_MONITOR)"
+        have_scope="$(daemon_env DOUBLETAKE_RESTORE_SCOPE)"
+        have_budget="$(daemon_env DOUBLETAKE_RELAY_BUDGET_MS)"
+        if [ "$have" != "$want" ] || [ "$have_scope" != "$want_scope" ] ||
+            [ "$have_budget" != "$want_budget" ]; then
+            if [ "$have" != "$want" ]; then
+                echo "mirrorling: capture monitor changed (${have:-auto} -> ${want:-auto}) — restarting the daemon"
+            elif [ "$have_scope" != "$want_scope" ]; then
+                echo "mirrorling: restore-token scope changed (${have_scope:-unset} -> $want_scope) — restarting the daemon"
+            else
+                echo "mirrorling: relay budget changed (${have_budget:-default} -> $want_budget ms) — restarting the daemon"
+            fi
             "$CTL" disconnect 2>/dev/null || true
             systemctl --user stop "$UNIT" 2>/dev/null || true
             cmd_start

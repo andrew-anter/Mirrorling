@@ -252,6 +252,10 @@
   }
   .pick[aria-checked="true"] .pick-dot { background: var(--green); border-color: var(--green); box-shadow: 0 0 7px rgba(70,196,110,.5); }
   .pick.offline { opacity: 0.6; }  /* saved TV, not on the network — dot still reads */
+  .pick:disabled { cursor: not-allowed; }
+  .pick:disabled:hover { background: none; }
+  .picklist[hidden] { display: none; }
+  .picklist + .picklist { margin-top: 4px; }
   .pick-main { display: flex; flex-direction: column; min-width: 0; flex: 1; }
   .pick-name { font-weight: 600; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .pick-meta { font-family: var(--mono); font-size: 11px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -431,9 +435,10 @@
 
       <section class="card">
         <div class="cardhead">
-          <span class="eyebrow">Monitor</span>
+          <span class="eyebrow">Display</span>
           <button class="ghost" id="monRefresh">Refresh</button>
         </div>
+        <div class="picklist" id="modeList" role="radiogroup" aria-label="How the TV uses a display"></div>
         <div class="picklist" id="monList" role="radiogroup" aria-label="Monitor to capture"></div>
         <p class="note" id="monNote" hidden></p>
       </section>
@@ -614,27 +619,67 @@ function render() {
 /* ---------- TV + monitor pick lists ---------- */
 
 var tvs = null, monitors = null;      // last fetched rows
+var monitorVirtual = { available: false };  // can this session create a virtual display?
 var tvsError = '', monitorsError = '';
 var pickBusy = false;
 var painted = {};                     // last painted signature per list
 
+// Windows-style display modes: "duplicate" casts a screen exactly as it looks
+// here, "extend" casts the virtual display so the TV gets a screen of its own.
+// The mode is derived from the same config the CLI persists — 'virtual' is the
+// pinned headless output, anything else (including auto) duplicates.
+function displayMode() {
+  return state && state.configured_monitor === 'virtual' ? 'extend' : 'duplicate';
+}
+
+function modeRows() {
+  return [
+    { name: 'duplicate', label: 'Duplicate', meta: 'the TV shows a screen exactly as it looks here' },
+    {
+      name: 'extend',
+      label: 'Extend',
+      meta: monitorVirtual.available
+        ? 'the TV gets its own screen (virtual display)'
+        : 'needs Hyprland, or Sway with its headless backend',
+      disabled: !monitorVirtual.available
+    }
+  ];
+}
+
 function markPicks() {
   var curTV = state && state.configured_tv ? state.configured_tv : '';
-  var curMon = state && state.configured_monitor ? state.configured_monitor : 'auto';
   paintPicks($('tvList'), curTV, 'tv');
+  paintMonitorCard();
+}
+
+// The Display card: mode switch on top, the physical monitor list only while
+// duplicating (in Extend mode the choice is the virtual output, not a screen),
+// and a note saying what the TV shows in each mode.
+function paintMonitorCard() {
+  var mode = displayMode();
+  var curMon = state && state.configured_monitor ? state.configured_monitor : 'auto';
+  paintPicks($('modeList'), mode, 'mode');
+  $('monList').hidden = mode === 'extend';
   paintPicks($('monList'), curMon, 'monitor');
+  var note = $('monNote');
+  if (mode === 'extend') {
+    note.hidden = false;
+    note.className = 'note';
+    note.textContent = 'Extend: the TV shows the virtual display’s workspace — bind one to it in your compositor config. The laptop keeps its own screens.';
+  } else if (monitors && monitors.length) {
+    note.hidden = true;
+  }
 }
 
 function paintPicks(listEl, current, kind) {
-  var rows = kind === 'tv' ? tvs : monitors;
+  var rows = kind === 'tv' ? tvs : kind === 'monitor' ? monitors : modeRows();
   if (!rows) return; // not fetched yet — poll marker pass skipped
   // render() runs on every 2 s poll: rebuilding the DOM each time drops
   // keyboard focus and hover mid-interaction — repaint only on real change
   // (rows or the configured marker).
-  var key = kind === 'tv' ? 'tv' : 'mon';
   var sig = JSON.stringify(rows) + '\u0000' + current;
-  if (painted[key] === sig) return;
-  painted[key] = sig;
+  if (painted[kind] === sig) return;
+  painted[kind] = sig;
   listEl.textContent = '';
   if (kind === 'monitor') {
     rows = [{ name: 'auto', label: 'Auto — share-picker dialog each cast' }].concat(
@@ -644,22 +689,33 @@ function paintPicks(listEl, current, kind) {
   rows.forEach(function (row) {
     var name = row.name;
     var offline = kind === 'tv' && row.state === 'saved';
-    var isCur = name === current || (kind === 'monitor' && name === 'auto' && current === 'auto');
-    var b = el('button', 'pick' + (offline ? ' offline' : ''));
+    var isCur = name === current;
+    var b = el('button', 'pick' + (offline || row.disabled ? ' offline' : ''));
     b.type = 'button';
     b.setAttribute('role', 'radio');
     b.setAttribute('aria-checked', isCur ? 'true' : 'false');
     b.append(el('span', 'pick-dot'));
     var main = el('span', 'pick-main');
-    main.append(el('span', 'pick-name', kind === 'monitor' ? row.label : name));
+    main.append(el('span', 'pick-name', row.label || name));
+    var meta = '';
     if (kind === 'tv') {
       // a saved row carries no ip/model — it is remembered, not on the network
-      var meta = offline ? 'saved — not on the network'
+      meta = offline ? 'saved — not on the network'
         : [row.ip, row.model].filter(Boolean).join(' · ');
-      if (meta) main.append(el('span', 'pick-meta', meta));
+    } else if (row.meta) {
+      meta = row.meta;
     }
+    if (meta) main.append(el('span', 'pick-meta', meta));
     b.append(main);
     if (isCur) b.append(el('span', 'pick-now', 'selected'));
+    // A mode this session cannot use stays visible (its meta says why) but not
+    // clickable. The current choice is never blocked, so turning Extend off
+    // keeps working even if the compositor lost the headless output.
+    if (row.disabled && !isCur) {
+      b.disabled = true;
+      listEl.append(b);
+      return;
+    }
     b.addEventListener('click', function () { pick(kind, name); });
     if (!offline) {
       listEl.append(b);
@@ -702,26 +758,41 @@ async function fetchMonitors() {
   try {
     var j = await getJSON('/api/monitors');
     monitors = (j && j.monitors) || [];
+    monitorVirtual = (j && j.virtual) || { available: false };
     monitorsError = (j && j.error) || '';
   } catch (e) { return; }
-  if (!monitors.length) setListNote($('monNote'), 'no monitors found — Wayland needs hyprctl, X11 needs xrandr.', monitorsError);
-  else $('monNote').hidden = true;
-  markPicks();
+  if (!monitors.length && displayMode() !== 'extend') {
+    setListNote($('monNote'), 'no monitors found — Wayland needs hyprctl, X11 needs xrandr.', monitorsError);
+  }
+  paintMonitorCard();
 }
 
 function refreshLists() { fetchTVs(); fetchMonitors(); }
 
 async function pick(kind, name) {
   if (pickBusy) return;
-  var current = kind === 'tv'
-    ? (state && state.configured_tv ? state.configured_tv : '')
-    : (state && state.configured_monitor ? state.configured_monitor : 'auto');
-  if (name === current) return;
+  // The mode switch writes the same MIRRORLING_MONITOR setting the monitor
+  // list does: Extend pins the virtual display, Duplicate goes back to the
+  // share-picker choice ('auto') — which screen to duplicate is the monitor
+  // list's next click, not a guess made here.
+  var target = kind, value = name;
+  if (kind === 'mode') {
+    if (name === displayMode()) return;
+    target = 'monitor';
+    value = name === 'extend' ? 'virtual' : 'auto';
+  } else {
+    var current = kind === 'tv'
+      ? (state && state.configured_tv ? state.configured_tv : '')
+      : (state && state.configured_monitor ? state.configured_monitor : 'auto');
+    if (name === current) return;
+  }
   pickBusy = true;
-  var j = await postJSON('/api/' + kind, { name: name });
+  var j = await postJSON('/api/' + target, { name: value });
   pickBusy = false;
   if (j.ok) {
-    toast(kind === 'tv' ? 'TV set to ' + name : 'Monitor set to ' + name);
+    toast(kind === 'tv' ? 'TV set to ' + name
+      : kind === 'mode' ? (name === 'extend' ? 'TV now extends the desktop' : 'TV duplicates a screen')
+        : 'Monitor set to ' + name);
   } else {
     toast((j.output || 'failed'), true);
   }

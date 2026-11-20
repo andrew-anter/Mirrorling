@@ -42,12 +42,29 @@ if [ -z "$m" ]; then
     exec hyprland-share-picker "$@"
 fi
 
+# Is the name a live Hyprland output right now? A hyprctl failure (no Hyprland
+# session — e.g. the X11 fallback path) counts as not connected.
+connected() {
+    hyprctl monitors 2>/dev/null | awk -v m="$1" '
+        $1 == "Monitor" && $2 == m { found = 1; exit }
+        END { exit found ? 0 : 1 }'
+}
+
+# 'virtual' (see: mirrorling monitor virtual) is the headless output the cast
+# should come from — never an output name itself. The CLI creates it before
+# the daemon starts; this recreates it as a safety net for casts that skipped
+# that step, so a fresh compositor session cannot silently turn a pinned
+# virtual display into a cast of the whole laptop screen. If creation loses
+# the race against xdph's name check, the fallback below still applies.
+if [ "$m" = "virtual" ]; then
+    m="${MIRRORLING_VIRTUAL:-mirrorling}"
+    connected "$m" || hyprctl output create headless "$m" >/dev/null 2>&1 || true
+fi
+
 # The configured monitor must be currently connected; a hyprctl failure (no
 # Hyprland session — e.g. the X11 fallback path) counts as not connected.
 # Either way delegate so casting still works.
-if hyprctl monitors 2>/dev/null | awk -v m="$m" '
-        $1 == "Monitor" && $2 == m { found = 1; exit }
-        END { exit found ? 0 : 1 }'; then
+if connected "$m"; then
     printf '[SELECTION]/screen:%s\n' "$m"
     exit 0
 fi

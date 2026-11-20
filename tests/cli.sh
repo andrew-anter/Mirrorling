@@ -75,8 +75,8 @@ reset_state() {
     rm -rf "$XDG_CONFIG_HOME" "$XDG_RUNTIME_DIR" "$XDG_DATA_HOME" "$HOME" "$STUB_DIR"
     mkdir -p "$XDG_CONFIG_HOME" "$XDG_RUNTIME_DIR" "$XDG_DATA_HOME" "$HOME" "$STUB_DIR"
     unset MIRRORLING_NAME MIRRORLING_FPS MIRRORLING_HWACCEL MIRRORLING_PORT_RANGE \
-        MIRRORLING_TIMING MIRRORLING_EXTRA_FLAGS MIRRORLING_MONITOR MIRRORLING_VERSION \
-        DISPLAY WAYLAND_DISPLAY 2>/dev/null || true
+        MIRRORLING_TIMING MIRRORLING_EXTRA_FLAGS MIRRORLING_MONITOR MIRRORLING_VIRTUAL \
+        MIRRORLING_VERSION DISPLAY WAYLAND_DISPLAY 2>/dev/null || true
 }
 
 # --- sandbox -----------------------------------------------------------------
@@ -112,14 +112,28 @@ EOF
 cat > "$STUB_BIN/hyprctl" <<'EOF'
 #!/usr/bin/env bash
 [ -f "${STUB_DIR}/hyprctl.ok" ] || exit 1
-if [ "${1:-}" = "monitors" ]; then
-    if [ -f "${STUB_DIR}/hyprctl.monitors" ]; then
-        cat "${STUB_DIR}/hyprctl.monitors"
-    else
-        printf 'Monitor eDP-1 (id 0):\n\t1920x1080@60.000 at 0x0\n'
-        printf 'Monitor HDMI-A-1 (id 1):\n\t2560x1440@60.000 at 1920x0\n'
-    fi
-fi
+case "${1:-}" in
+    monitors)
+        if [ -f "${STUB_DIR}/hyprctl.monitors" ]; then
+            cat "${STUB_DIR}/hyprctl.monitors"
+        else
+            printf 'Monitor eDP-1 (id 0):\n\t1920x1080@60.000 at 0x0\n'
+            printf 'Monitor HDMI-A-1 (id 1):\n\t2560x1440@60.000 at 1920x0\n'
+        fi
+        # Headless outputs this stub was asked to create: one marker file each.
+        for f in "${STUB_DIR}"/output.*; do
+            [ -e "$f" ] || continue
+            printf 'Monitor %s (id 9):\n\t1920x1080@60.000 at 1920x0\n' "${f##*/output.}"
+        done
+        ;;
+    output)
+        printf '%s\n' "$*" >> "${STUB_DIR}/hyprctl.calls"
+        if [ "${2:-}" = "create" ]; then
+            [ -f "${STUB_DIR}/hyprctl.create.fail" ] && exit 1
+            : > "${STUB_DIR}/output.${4:-unnamed}"
+        fi
+        ;;
+esac
 exit 0
 EOF
 
@@ -158,6 +172,12 @@ case "$verb" in
         ;;
     show)
         [ -f "${STUB_DIR}/systemctl.show" ] && cat "${STUB_DIR}/systemctl.show"
+        ;;
+    stop|restart|try-restart)
+        if [ -f "${STUB_DIR}/active" ] && [ -n "$unit" ]; then
+            grep -vx -e "$unit" "${STUB_DIR}/active" > "${STUB_DIR}/active.tmp" 2>/dev/null || true
+            mv "${STUB_DIR}/active.tmp" "${STUB_DIR}/active"
+        fi
         ;;
 esac
 exit 0
@@ -234,7 +254,31 @@ esac
 exit 0
 EOF
 
-chmod +x "$STUB_BIN/avahi-browse" "$STUB_BIN/hyprctl" "$STUB_BIN/systemctl" \
+cat > "$STUB_BIN/swaymsg" <<'EOF'
+#!/usr/bin/env bash
+[ -f "${STUB_DIR}/swaymsg.ok" ] || exit 1
+printf '%s\n' "$*" >> "${STUB_DIR}/swaymsg.calls"
+case "$*" in
+    "-t get_outputs --raw")
+        printf '[{"name":"eDP-1","active":true}'
+        for f in "${STUB_DIR}"/swayout.*; do
+            [ -e "$f" ] || continue
+            printf ',{"name":"%s","active":true}' "${f##*/swayout.}"
+        done
+        printf ']\n'
+        ;;
+    "create_output")
+        if [ -f "${STUB_DIR}/swaymsg.create.fail" ]; then
+            echo "Can only create outputs for Wayland, X11 or headless backends" >&2
+            exit 1
+        fi
+        : > "${STUB_DIR}/swayout.HEADLESS-1"
+        ;;
+esac
+exit 0
+EOF
+
+chmod +x "$STUB_BIN/avahi-browse" "$STUB_BIN/hyprctl" "$STUB_BIN/swaymsg" "$STUB_BIN/systemctl" \
     "$STUB_BIN/systemd-run" "$STUB_BIN/journalctl" "$STUB_BIN/busctl" \
     "$APP/bin/doubletake-ctl"
 
@@ -549,6 +593,7 @@ test_env_fps_start() {
     assert_contains "$joined" "-hwaccel auto" "hwaccel is passed"
     assert_contains "$joined" "--collect" "systemd-run uses --collect"
     assert_contains "$joined" "--setenv=DOUBLETAKE_TIMING=NTP" "timing default reaches the daemon env"
+    assert_contains "$joined" "--setenv=DOUBLETAKE_RELAY_BUDGET_MS=5000" "relay budget default reaches the daemon env"
     assert_contains "$(cat "$STUB_DIR/systemctl.calls")" "reset-failed mirrorling" "start resets a failed unit first"
     assert_contains "$out" '"state":"idle"' "start prints daemon status after the socket appears"
 }
@@ -914,6 +959,179 @@ EOF
     ok "mirrorling ui exits once its server is gone"
 }
 
+# MIRRORLING_MONITOR=virtual pins a headless Hyprland output instead of a
+# physical screen. The CLI must create it on demand (Hyprland does not persist
+# headless outputs), refuse to pin it when there is no Hyprland to create it
+# in, and pass the resolved name — never the literal "virtual" — to the daemon.
+test_virtual_monitor() {
+    reset_state
+    mkdir -p "$(dirname "$(conf_path)")"
+    printf 'MIRRORLING_NAME="Sam58"\n' > "$(conf_path)"
+    printf '{"state":"idle"}\n' > "$STUB_DIR/status.json"
+
+    local out
+    out="$(WAYLAND_DISPLAY=wayland-1 "$APP/mirrorling" monitor virtual 2>&1)" &&
+        fail "monitor virtual must fail when no compositor can add an output"
+    assert_contains "$out" "cast an existing output instead" "the refusal names the portable alternative"
+    assert_not_contains "$(cat "$(conf_path)")" "MIRRORLING_MONITOR" "failed virtual setup saves nothing"
+
+    : > "$STUB_DIR/hyprctl.ok"
+    out="$(WAYLAND_DISPLAY=wayland-1 "$APP/mirrorling" monitor virtual 2>&1)" ||
+        fail "monitor virtual failed with a working Hyprland: $out"
+    assert_contains "$out" "virtual display 'mirrorling'" "monitor virtual names the resolved output"
+    assert_contains "$(cat "$STUB_DIR/hyprctl.calls")" "output create headless mirrorling" "the headless output is created"
+    assert_eq "$("$APP/mirrorling" monitor --raw)" "virtual" "virtual is persisted as the pinned monitor"
+
+    : > "$STUB_DIR/hyprctl.calls"
+    WAYLAND_DISPLAY=wayland-1 "$APP/mirrorling" monitor virtual >/dev/null 2>&1 ||
+        fail "second monitor virtual failed"
+    [ ! -s "$STUB_DIR/hyprctl.calls" ] || fail "an existing virtual output was re-created"
+    ok "an existing virtual output is not re-created"
+
+    out="$(WAYLAND_DISPLAY=wayland-1 "$APP/mirrorling" monitors)"
+    assert_contains "$out" "mirrorling (configured)" "monitors marks the virtual output as configured"
+
+    # A creation failure keeps the pin unset instead of silently casting the
+    # laptop screen.
+    reset_state
+    mkdir -p "$(dirname "$(conf_path)")"
+    printf 'MIRRORLING_NAME="Sam58"\n' > "$(conf_path)"
+    : > "$STUB_DIR/hyprctl.ok"
+    : > "$STUB_DIR/hyprctl.create.fail"
+    out="$(WAYLAND_DISPLAY=wayland-1 "$APP/mirrorling" monitor virtual 2>&1)" &&
+        fail "monitor virtual must fail when the output cannot be created"
+    assert_contains "$out" "cannot create the virtual output 'mirrorling'" "creation failure is explained"
+    assert_not_contains "$(cat "$(conf_path)")" "MIRRORLING_MONITOR" "creation failure saves nothing"
+}
+
+test_virtual_cast_source() {
+    reset_state
+    mkdir -p "$(dirname "$(conf_path)")"
+    printf 'MIRRORLING_NAME="Sam58"\nMIRRORLING_MONITOR="virtual"\n' > "$(conf_path)"
+    printf '{"state":"idle"}\n' > "$STUB_DIR/status.json"
+    : > "$STUB_DIR/hyprctl.ok"
+    local out joined
+    out="$(WAYLAND_DISPLAY=wayland-1 "$APP/mirrorling" start 2>&1)" ||
+        fail "start with virtual failed: $out"
+    assert_contains "$(cat "$STUB_DIR/hyprctl.calls")" "output create headless mirrorling" "start creates the missing virtual output before the daemon"
+    joined="$(awk 'BEGIN { sep = "" } { printf "%s%s", sep, $0; sep = " " } END { print "" }' \
+        "$STUB_DIR/systemd-run.args")"
+    assert_contains "$joined" "--setenv=DOUBLETAKE_MONITOR=mirrorling" "the daemon gets the resolved name, not 'virtual'"
+    assert_contains "$joined" "--setenv=DOUBLETAKE_RESTORE_SCOPE=mirrorling" "restore tokens are scoped per source"
+    assert_contains "$joined" "--setenv=DOUBLETAKE_RELAY_BUDGET_MS=5000" "the relay budget reaches the daemon"
+
+    # MIRRORLING_VIRTUAL renames the output end to end.
+    reset_state
+    mkdir -p "$(dirname "$(conf_path)")"
+    printf 'MIRRORLING_NAME="Sam58"\nMIRRORLING_MONITOR="virtual"\nMIRRORLING_VIRTUAL="tvscreen"\n' > "$(conf_path)"
+    printf '{"state":"idle"}\n' > "$STUB_DIR/status.json"
+    : > "$STUB_DIR/hyprctl.ok"
+    out="$(WAYLAND_DISPLAY=wayland-1 "$APP/mirrorling" start 2>&1)" ||
+        fail "start with a custom virtual name failed: $out"
+    assert_contains "$(cat "$STUB_DIR/hyprctl.calls")" "output create headless tvscreen" "MIRRORLING_VIRTUAL names the output"
+    joined="$(awk 'BEGIN { sep = "" } { printf "%s%s", sep, $0; sep = " " } END { print "" }' \
+        "$STUB_DIR/systemd-run.args")"
+    assert_contains "$joined" "--setenv=DOUBLETAKE_MONITOR=tvscreen" "custom name reaches the daemon"
+}
+
+test_sway_virtual() {
+    reset_state
+    mkdir -p "$(dirname "$(conf_path)")"
+    printf 'MIRRORLING_NAME="Sam58"\n' > "$(conf_path)"
+    printf '{"state":"idle"}\n' > "$STUB_DIR/status.json"
+    : > "$STUB_DIR/swaymsg.ok"
+    local out joined
+    out="$("$APP/mirrorling" monitor virtual 2>&1)" || fail "monitor virtual on sway failed: $out"
+    assert_contains "$out" "virtual display 'HEADLESS-1'" "sway's own headless name is reported"
+    assert_contains "$(cat "$STUB_DIR/swaymsg.calls")" "create_output" "sway adds the output with create_output"
+    assert_eq "$("$APP/mirrorling" monitor --raw)" "virtual" "virtual stays the configured value on sway"
+
+    : > "$STUB_DIR/swaymsg.calls"
+    WAYLAND_DISPLAY=wayland-1 "$APP/mirrorling" start >/dev/null 2>&1 || fail "start on sway failed"
+    if grep -qx 'create_output' "$STUB_DIR/swaymsg.calls"; then
+        fail "the existing headless output was re-created"
+    fi
+    ok "an existing sway headless output is reused"
+    joined="$(awk 'BEGIN { sep = "" } { printf "%s%s", sep, $0; sep = " " } END { print "" }' \
+        "$STUB_DIR/systemd-run.args")"
+    assert_contains "$joined" "--setenv=DOUBLETAKE_MONITOR=HEADLESS-1" "sway's headless name reaches the daemon"
+    assert_contains "$joined" "--setenv=DOUBLETAKE_RESTORE_SCOPE=HEADLESS-1" "restore scope follows the sway output"
+
+    # No headless backend in the session: refuse, keep the config, say why.
+    reset_state
+    mkdir -p "$(dirname "$(conf_path)")"
+    printf 'MIRRORLING_NAME="Sam58"\n' > "$(conf_path)"
+    : > "$STUB_DIR/swaymsg.ok"
+    : > "$STUB_DIR/swaymsg.create.fail"
+    out="$("$APP/mirrorling" monitor virtual 2>&1)" && fail "monitor virtual must fail without a headless backend"
+    assert_contains "$out" "headless backend" "the WLR_BACKENDS hint is printed"
+    assert_contains "$out" "Can only create outputs" "sway's own error is preserved"
+    assert_not_contains "$(cat "$(conf_path)")" "MIRRORLING_MONITOR" "failed sway setup saves nothing"
+}
+
+test_picker_virtual() {
+    reset_state
+    mkdir -p "$(dirname "$(conf_path)")"
+    printf 'MIRRORLING_MONITOR="virtual"\n' > "$(conf_path)"
+    : > "$STUB_DIR/hyprctl.ok"
+    local out
+    out="$("$APP/mirrorling-picker" 2>&1)" || fail "picker with virtual failed: $out"
+    assert_contains "$out" "[SELECTION]/screen:mirrorling" "picker selects the virtual output"
+    assert_contains "$(cat "$STUB_DIR/hyprctl.calls" 2>/dev/null || true)" "output create headless mirrorling" "picker recreates a missing virtual output"
+
+    : > "$STUB_DIR/hyprctl.calls"
+    out="$("$APP/mirrorling-picker" 2>&1)" || fail "picker with an existing virtual output failed: $out"
+    assert_contains "$out" "[SELECTION]/screen:mirrorling" "picker selects an existing virtual output"
+    [ ! -s "$STUB_DIR/hyprctl.calls" ] || fail "picker re-created an existing output"
+    ok "picker does not re-create an existing virtual output"
+
+    # No Hyprland: no selection may be claimed (the stock picker takes over).
+    rm -f "$STUB_DIR/hyprctl.ok"
+    out="$("$APP/mirrorling-picker" 2>&1 || true)"
+    assert_not_contains "$out" "[SELECTION]" "picker claims no selection without Hyprland"
+}
+
+# The daemon's environment is fixed at spawn, so a capture-source or
+# restore-token-scope change must restart it — otherwise the old scope keeps
+# writing the token the new source no longer reads. A matching environment
+# must NOT restart (that would drop a live stream for nothing).
+test_restore_scope_drift() {
+    reset_state
+    write_avahi_live
+    mkdir -p "$(dirname "$(conf_path)")"
+    printf 'MIRRORLING_NAME="Living Room TV"\nMIRRORLING_MONITOR="eDP-1"\n' > "$(conf_path)"
+    printf '{"state":"idle"}\n' > "$STUB_DIR/status.json"
+    printf '127.0.0.1\n' > "$STUB_DIR/devices.txt"
+    printf 'mirrorling\n' > "$STUB_DIR/active"
+
+    # Daemon started before scopes existed: monitor matches, scope is absent.
+    printf 'Environment=DOUBLETAKE_TIMING=NTP DOUBLETAKE_MONITOR=eDP-1\n' > "$STUB_DIR/systemctl.show"
+    : > "$STUB_DIR/systemctl.calls"
+    : > "$STUB_DIR/systemd-run.args"
+    local out
+    out="$("$APP/mirrorling" on </dev/null 2>&1)" || fail "on with a stale scope failed: $out"
+    assert_contains "$out" "restore-token scope changed" "a missing scope restarts the daemon"
+    assert_contains "$(cat "$STUB_DIR/systemctl.calls")" "stop mirrorling" "the stale daemon is stopped"
+    assert_contains "$(cat "$STUB_DIR/systemd-run.args")" "--setenv=DOUBLETAKE_RESTORE_SCOPE=eDP-1" "the restarted daemon gets the scope"
+    # The stub's systemd-run does not bring the transient unit back up; systemd
+    # would. Mark it active so the next check exercises the drift comparison
+    # instead of the "start it" branch.
+    printf 'mirrorling\n' > "$STUB_DIR/active"
+
+    # Matching monitor and scope: leave the running daemon alone.
+    printf 'Environment=DOUBLETAKE_TIMING=NTP DOUBLETAKE_MONITOR=eDP-1 DOUBLETAKE_RESTORE_SCOPE=eDP-1 DOUBLETAKE_RELAY_BUDGET_MS=5000\n' > "$STUB_DIR/systemctl.show"
+    : > "$STUB_DIR/systemctl.calls"
+    out="$("$APP/mirrorling" on </dev/null 2>&1)" || fail "on with a matching env failed: $out"
+    assert_not_contains "$(cat "$STUB_DIR/systemctl.calls")" "stop mirrorling" "matching monitor+scope keeps the daemon"
+
+    # Same source, different relay budget: the engine read it at spawn only.
+    printf 'Environment=DOUBLETAKE_TIMING=NTP DOUBLETAKE_MONITOR=eDP-1 DOUBLETAKE_RESTORE_SCOPE=eDP-1 DOUBLETAKE_RELAY_BUDGET_MS=250\n' > "$STUB_DIR/systemctl.show"
+    : > "$STUB_DIR/systemctl.calls"
+    out="$("$APP/mirrorling" on </dev/null 2>&1)" || fail "on with a stale budget failed: $out"
+    assert_contains "$out" "relay budget changed" "a budget change restarts the daemon"
+    assert_contains "$(cat "$STUB_DIR/systemctl.calls")" "stop mirrorling" "the old-budget daemon is stopped"
+}
+
 # --- run ---------------------------------------------------------------------
 start_listeners
 
@@ -930,6 +1148,11 @@ test_stale_socket
 test_picker_setup
 test_picker_reclaim
 test_picker_write_failure
+test_virtual_monitor
+test_virtual_cast_source
+test_sway_virtual
+test_restore_scope_drift
+test_picker_virtual
 test_tray_status
 test_ui
 test_ui_port_validation

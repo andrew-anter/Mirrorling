@@ -5,6 +5,50 @@ All notable changes to this project are documented here. The format loosely foll
 
 ## [Unreleased]
 
+### Fixed
+
+- **Casts no longer die when the TV's Wi-Fi receiver hiccups.** The bundled engine detached a
+  receiver whose video socket stalled longer than a quarter second (`broadcast sink backlog limit
+  exceeded`), and bounded one frame write at 2 s (`send non-IDR: … i/o timeout`). The CU7000 does
+  stop draining for 2 s+ every few minutes even though the LAN is clean (100 pings: 0 % loss,
+  6.1 ms average, 33.8 ms max), so both limits ended casts. Fork patches 8–9 add
+  `DOUBLETAKE_RELAY_BUDGET_MS`, used for the fan-out queue and for the per-frame socket deadline
+  (default unchanged at 250 ms / 2 s); mirrorling passes `MIRRORLING_RELAY_BUDGET_MS=5000`, so a
+  five-second receiver stall is ridden out instead of ending the session. Memory stays under the
+  engine's 8 MiB bound (~2.6 MB at 4.1 Mbit/s), and a budget change restarts the running daemon
+  like a monitor change does.
+- **Audio no longer goes silent for the rest of a cast.** One transient
+  `audio send: … sendto: network is unreachable` (a route flap or interface re-addressing) ended
+  the audio stream permanently while video kept playing. Fork patch 10 retries `ENETUNREACH`,
+  `EHOSTUNREACH`, `ENETDOWN` and `EADDRNOTAVAIL` on the audio data path with exponential backoff
+  (~1.5 s total, inside the receiver's jitter buffer); non-transient errors still end audio. The
+  capture source itself was correct: the engine recorded `@DEFAULT_MONITOR@`
+  (`echo_cancel_sink.monitor` here).
+
+### Added
+
+- **Virtual display as the capture source.** `mirrorling monitor virtual` pins a headless Hyprland
+  output (`MIRRORLING_VIRTUAL`, default `mirrorling`) instead of a physical screen, so the TV can
+  show a workspace of its own while the laptop is used normally. Hyprland drops headless outputs on
+  restart, so `mirrorling start`/`on` create it before the daemon spawns and the picker recreates it
+  as a fallback; a failed creation aborts instead of silently casting the laptop screen. Monitor
+  layout and the workspace binding stay in the Hyprland config (see README).
+- **Duplicate / Extend in the control panel.** The panel's Display card mirrors Windows' display
+  modes: Duplicate casts a screen as it looks (Auto or a named monitor), Extend pins the virtual
+  display so the TV gets a screen of its own. Extend is shown but disabled with the reason where no
+  headless output can be created (no Hyprland session); `/api/monitors` reports that availability.
+- **Compositor-agnostic virtual display.** The headless output now comes from a per-session
+  provider: Hyprland (`hyprctl output create headless`) or Sway (`swaymsg create_output`, reusing
+  and reporting the `HEADLESS-N` Sway names itself); on any other compositor `mirrorling monitor
+  virtual` refuses with the alternative spelled out instead of casting the laptop screen.
+  `mirrorling monitors` reads Sway outputs too, and the panel reports Extend as available wherever
+  either control socket answers. The daemon now receives `DOUBLETAKE_RESTORE_SCOPE`, so portals
+  with session restore (KDE, GNOME, …) keep one restore token per capture source: duplicate and
+  extend sessions no longer overwrite each other and stay dialog-free after their own first pick.
+  A scope change restarts the running daemon like a monitor change does. README documents the
+  per-compositor matrix (Sway headless backend, KDE `krfb-virtualmonitor`, GNOME, X11, and the
+  `xdg-desktop-portal-wlr` chooser pin).
+
 ## [0.1.1-alpha] — 2026-11-04
 
 ### Fixed

@@ -176,14 +176,26 @@ func (s *server) handleMonitors(w http.ResponseWriter, r *http.Request) {
 	if !methodOnly(w, r, http.MethodGet) {
 		return
 	}
+	// "Extend" in the panel pins the virtual display; that needs a compositor
+	// that can add a headless output at runtime (Hyprland, or Sway with its
+	// headless backend), so report the same probes the CLI's virtual support
+	// uses instead of letting the click fail.
+	virtual := map[string]any{"available": false}
+	for _, probe := range [][]string{{"hyprctl", "monitors"}, {"swaymsg", "-t", "get_outputs"}} {
+		if exit, _, _, timedOut := exec_(r.Context(), timeoutRaw, probe[0], probe[1:]...); exit == 0 && !timedOut {
+			virtual["available"] = true
+			break
+		}
+	}
 	exit, stdout, stderr, timedOut := exec_(r.Context(), timeoutList, s.mirrorling, "monitors", "--raw")
 	if timedOut {
-		writeJSON(w, http.StatusOK, map[string]any{"monitors": []string{}, "error": "timed out"})
+		writeJSON(w, http.StatusOK, map[string]any{"monitors": []string{}, "virtual": virtual, "error": "timed out"})
 		return
 	}
 	if exit != 0 {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"monitors": []string{},
+			"virtual":  virtual,
 			"error":    firstNonEmpty(strings.TrimSpace(stderr), strings.TrimSpace(stdout)),
 		})
 		return
@@ -194,7 +206,7 @@ func (s *server) handleMonitors(w http.ResponseWriter, r *http.Request) {
 			mons = append(mons, line)
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"monitors": mons})
+	writeJSON(w, http.StatusOK, map[string]any{"monitors": mons, "virtual": virtual})
 }
 
 // handleSetTV persists the chosen TV via `mirrorling tv <name>`.

@@ -187,6 +187,79 @@ func TestGetRoutesDoNotRequireJSONContentType(t *testing.T) {
 	}
 }
 
+// The panel offers Duplicate or Extend for the TV. Extend pins the virtual
+// display, which only a live Hyprland session can create, so /api/monitors
+// must report that up front: the panel then shows Extend disabled with the
+// reason instead of sending a click that has to fail.
+func TestMonitorsReportsVirtualAvailability(t *testing.T) {
+	dir := t.TempDir()
+	mirrorling := writeStub(t, dir, "mirrorling", "#!/bin/sh\nprintf 'eDP-1\\nHDMI-A-1\\n'\n")
+	mux := (&server{mirrorling: mirrorling}).newMux()
+
+	var body struct {
+		Monitors []string `json:"monitors"`
+		Virtual  struct {
+			Available bool `json:"available"`
+		} `json:"virtual"`
+	}
+	read := func() {
+		t.Helper()
+		rec := serve(mux, http.MethodGet, "/api/monitors", "", "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET /api/monitors status = %d, want 200", rec.Code)
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("GET /api/monitors body is not JSON: %v (%q)", err, rec.Body.String())
+		}
+	}
+
+	// No hyprctl on PATH: no Hyprland, no virtual display.
+	t.Setenv("PATH", dir)
+	read()
+	if body.Virtual.Available {
+		t.Fatalf("virtual marked available without hyprctl")
+	}
+	if strings.Join(body.Monitors, ",") != "eDP-1,HDMI-A-1" {
+		t.Fatalf("monitors = %v, want the CLI rows", body.Monitors)
+	}
+
+	// A working hyprctl (a Hyprland session) enables Extend.
+	writeStub(t, dir, "hyprctl", "#!/bin/sh\nexit 0\n")
+	read()
+	if !body.Virtual.Available {
+		t.Fatalf("virtual not marked available with a working hyprctl")
+	}
+
+	// Sway can add a headless output too, so its control socket counts.
+	t.Setenv("PATH", dir)
+	if err := os.Remove(filepath.Join(dir, "hyprctl")); err != nil {
+		t.Fatal(err)
+	}
+	writeStub(t, dir, "swaymsg", "#!/bin/sh\nexit 0\n")
+	read()
+	if !body.Virtual.Available {
+		t.Fatalf("virtual not marked available with a working swaymsg")
+	}
+}
+
+// The Extend switch reuses the monitor endpoint with the reserved "virtual"
+// name; what that means (a headless output, created on demand) belongs to the
+// CLI, so the panel only has to pass it through.
+func TestSetMonitorVirtualForwarded(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "marker")
+	mirrorling := writeStub(t, dir, "mirrorling", fmt.Sprintf(
+		"#!/bin/sh\nprintf '%%s\\n' \"$*\" >> '%s'\n", marker))
+	rec := serve((&server{mirrorling: mirrorling}).newMux(),
+		http.MethodPost, "/api/monitor", "application/json", `{"name":"virtual"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST /api/monitor status = %d, want 200 (body %s)", rec.Code, rec.Body)
+	}
+	if out := markerContents(t, marker); out != "monitor virtual" {
+		t.Fatalf("CLI ran with %q, want %q", out, "monitor virtual")
+	}
+}
+
 func TestIndexServesPanelWithOfflineBanner(t *testing.T) {
 	rec := serve((&server{}).newMux(), http.MethodGet, "/", "", "")
 	if rec.Code != http.StatusOK {
